@@ -1,4 +1,4 @@
 __pycache__/
 *.pyc
-config/settings.json
+obs-dogs-chat/config/settings.json
 server.log
