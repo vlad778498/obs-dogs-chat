@@ -1,0 +1,11 @@
+{
+  "channels": [
+    "shroud"
+  ],
+  "active_window_seconds": 3600,
+  "refresh_ui_seconds": 5,
+  "max_dogs": 60,
+  "nickname": "",
+  "http_port": 8377,
+  "http_host": "127.0.0.1"
+}

@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "max_dogs": 60,                    # максимум собак на экране
     "nickname": "",                    # ник для IRC (пусто = justinfan random)
     "http_port": 8377,
+    "http_host": "127.0.0.1",          # 0.0.0.0 — если сервер на ВМ, а OBS на другой машине
 }
 
 
@@ -403,6 +404,7 @@ def main():
     ap = argparse.ArgumentParser(description="OBS Dogs of Chat plugin")
     ap.add_argument("--demo", action="store_true", help="эмуляция чата вместо Twitch")
     ap.add_argument("--port", type=int, default=None, help="HTTP порт (по умолчанию из config)")
+    ap.add_argument("--host", default=None, help="IP для.bind (0.0.0.0 — доступ с других машин)")
     ap.add_argument("--channels", nargs="*", default=None, help="каналы Twitch через пробел")
     args = ap.parse_args()
 
@@ -410,6 +412,7 @@ def main():
     if args.channels:
         config["channels"] = args.channels
     port = args.port or config.get("http_port", 8377)
+    host = args.host or config.get("http_host", "127.0.0.1")
 
     store = ActivityStore(config)
 
@@ -423,10 +426,13 @@ def main():
     Handler.store = store
     Handler.config = config
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = ThreadingHTTPServer((host, port), Handler)
     print("=" * 60)
-    print(f"  Собаки чата запущены:  http://localhost:{port}")
-    print(f"  В OBS: Источник -> Браузер -> URL http://localhost:{port}")
+    shown_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host
+    print(f"  Собаки чата запущены:  http://{shown_host}:{port}")
+    if host == "0.0.0.0":
+        print(f"  Доступ из других машин:  http://IP_этой_машины:{port}")
+    print(f"  В OBS: Источник -> Браузер -> URL http://{shown_host}:{port}")
     print(f"  Активность: сообщение за последние {config['active_window_seconds']} сек")
     print("  Ctrl+C — остановить.")
     print("=" * 60)

@@ -1,0 +1,28 @@
+# Установка (на сервере/ВМ):
+#   1. Скопировать проект: sudo cp -r obs-dogs-chat /opt/dogs-chat
+#   2. sudo pip3 install websockets
+#   3. sudo cp deploy/dogs-chat.service /etc/systemd/system/
+#      (при необходимости поправить User/WorkingDirectory/ExecStart)
+#   4. sudo systemctl daemon-reload
+#   5. sudo systemctl enable --now dogs-chat
+#   6. journalctl -u dogs-chat -f   — логи
+#
+# ВАЖНО: для доступа из OBS с другой машины в config/settings.json
+# поставьте "http_host": "0.0.0.0" и откройте порт 8377 в firewall /
+# security group облака.
+
+[Unit]
+Description=OBS Dogs of Chat (Twitch active chatters as dogs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/dogs-chat
+ExecStart=/usr/bin/python3 /opt/dogs-chat/dogs_chat.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
