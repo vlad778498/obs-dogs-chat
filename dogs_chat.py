@@ -326,6 +326,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self):
+        # HEAD поддерживается для проверок типа `curl -I`
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/api/stream":
