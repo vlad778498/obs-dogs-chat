@@ -1,0 +1,91 @@
+/* Собаки чата — вид для OBS Browser Source */
+:root {
+  --bg: rgba(16, 18, 26, 0.55);
+  --card: rgba(255, 255, 255, 0.07);
+  --card-border: rgba(255, 255, 255, 0.14);
+  --text: #f2f4fa;
+  --accent: #ffb347;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  font-family: "Segoe UI", Arial, sans-serif;
+  color: var(--text);
+  background: transparent; /* OBS: включите "Custom CSS -> body {background: transparent}" или оставьте как есть */
+  overflow: hidden;
+}
+
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  background: var(--bg);
+  backdrop-filter: blur(2px);
+  z-index: -1;
+}
+
+#header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 20px;
+  font-weight: 700; letter-spacing: 2px;
+}
+#header .paw { font-size: 26px; animation: wag 1.2s ease-in-out infinite; }
+#title { font-size: 22px; color: var(--accent); text-shadow: 0 2px 8px rgba(0,0,0,.5); }
+#counter {
+  margin-left: auto; font-size: 15px; opacity: .85;
+  background: var(--card); border: 1px solid var(--card-border);
+  padding: 4px 12px; border-radius: 999px;
+}
+
+@keyframes wag {
+  0%,100% { transform: rotate(-12deg); }
+  50%     { transform: rotate(12deg); }
+}
+
+#yard {
+  display: flex; flex-wrap: wrap; align-content: flex-start;
+  gap: 14px; padding: 10px 20px;
+  height: calc(100vh - 120px);
+  overflow: hidden;
+}
+
+.dog {
+  width: 118px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  padding: 10px 8px 8px;
+  text-align: center;
+  animation: pop .45s cubic-bezier(.2,1.6,.4,1) both;
+  transition: transform .2s;
+}
+.dog:hover { transform: translateY(-3px); }
+.dog.leaving { animation: fadeout .5s forwards; }
+
+@keyframes pop {
+  from { transform: scale(.3); opacity: 0; }
+  to   { transform: scale(1);  opacity: 1; }
+}
+@keyframes fadeout {
+  to { transform: scale(.5) translateY(10px); opacity: 0; }
+}
+
+.breed { font-size: 40px; line-height: 1; user-select: none; }
+.name {
+  margin-top: 6px; font-size: 13px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.meta { font-size: 10.5px; opacity: .65; margin-top: 2px; }
+
+/* "свежая" собака (писала < 5 мин) светится */
+.dog.hot { border-color: var(--accent); box-shadow: 0 0 14px rgba(255,179,71,.35); }
+
+/* полоска "остывания": час -> пусто */
+.timer { height: 4px; border-radius: 2px; margin-top: 6px; background: rgba(255,255,255,.12); overflow: hidden; }
+.timer > i { display: block; height: 100%; background: linear-gradient(90deg, #ff6b6b, var(--accent), #7bed9f); }
+
+#status {
+  position: fixed; bottom: 8px; right: 14px;
+  font-size: 11px; opacity: .5;
+}
