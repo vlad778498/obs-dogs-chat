@@ -79,3 +79,7 @@ python dogs_chat.py --channels канал1 канал2
 ## Лицензия
 
 MIT — делайте что хотите, гав.
+
+## Установка на сервер (Proxmox CT, Debian 13)
+
+Подробная пошаговая инструкция: [docs/INSTALL-PROXMOX-DEBIAN13.md](docs/INSTALL-PROXMOX-DEBIAN13.md)
