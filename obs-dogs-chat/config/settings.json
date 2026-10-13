@@ -1,7 +1,0 @@
-{
-  "channels": ["мой_канал"],
-  "active_window_seconds": 3600,
-  "max_dogs": 20,
-  "http_port": 8377,
-  "http_host": "127.0.0.1"
-}
