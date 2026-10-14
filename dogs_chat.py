@@ -249,60 +249,66 @@ class RawTCPClient:
             data += "\r\n"
         self.sock.sendall(data.encode("utf-8"))
 
-    def recv(self, timeout=1.0):
-        """Вернуть ВСЕ накопленные полные строки одним сообщением (\\r\\n между ними).
+    def _extract_lines(self):
+        """Забрать из буфера ВСЕ полные строки (каждая завершена \\n).
 
-        Важно: раньше возвращалась одна строка за вызов, и PING мог «залежаться»
-        в буфере, пока мы его не дочитаем, — Twitch закрывал соединение за
-        молчание (ConnectionReset сразу после подключения при оживлённом канале).
-        Теперь читаем всё доступное и отдаём целиком, чтобы PING обрабатывался
-        немедленно.
-
-        ВАЖНО (исправление «сообщения пропадают примерно через 120 c»): на
-        Windows Python < 3.10 бросает при таймауте socket.timeout, а начиная
-        с 3.10 — TimeoutError (это разные классы!). Здесь перехватываются ОБА,
-        иначе сокет остаётся с выставленным settimeout(1.0) и любой последующий
-        send() (PING/JOIN в keep-alive ветке) через ~120 c молчания чата
-        падает с BlockingIOError/WOULDBLOCK -> соединение рвалось и
-        переподключалось само собой.
+        Делим по b"\\n": последний фрагмент без переводы строки — незавершённая
+        линия, она ОСТАЁТСЯ в буфере до следующего пакета.
         """
-        self.sock.settimeout(timeout)
-        timed_out = False
-        try:
-            chunk = self.sock.recv(65536)
-        except (socket.timeout, TimeoutError):
-            # Таймаут чтения — ШТАТНАЯ ситуация (в чате тихо), НЕ ошибка
-            # сокета. ВАЖНО: TimeoutError является подклассом OSError,
-            # поэтому этот except ОБЯЗАН стоять перед обработкой OSError —
-            # иначе живой коннект рвался при первой же секунде тишины чата
-            # («сообщения перестают появляться примерно через 120 c»).
-            chunk = b""
-            timed_out = True
-        except OSError:
-            raise  # настоящая ошибка сокета — наверх (переподключение)
-        finally:
-            # вернуть неблокирующему сокету бесконечный таймаут:
-            # send() обязан блокироваться до отправки, а не падать по таймауту
-            self.sock.settimeout(None)
-        if timed_out:
-            # таймаут истёк, но в буфере могли остаться полные линии — отдадим их
-            if b"\n" in self.buf:
-                out, self.buf = self.buf, b""
-                return out.decode("utf-8", "replace")
-            return None
-        if not chunk:
-            raise ConnectionError("Twitch закрыл TCP-соединение")
-        self.buf += chunk
         if b"\n" not in self.buf:
-            return ""  # линии пока нет — подождём следующий chunk
-        # делим так, чтобы последний НЕЗАВЕРШЁННЫЙ фрагмент остался в буфере
+            return []
         parts = self.buf.split(b"\n")
-        self.buf = parts.pop()  # хвост без \n (может быть b"")
+        self.buf = parts.pop()  # хвост без \n — ждём продолжения
         lines = [p.rstrip(b"\r") for p in parts]
-        while lines and not lines[-1].strip():
-            lines.pop()  # не отдаём пустые хвосты (split по \r\n даёт "")
-        return ("\r\n".join(l.decode("utf-8", "replace") for l in lines)
-                if lines else "")
+        return [l.decode("utf-8", "replace") for l in lines if l.strip()]
+
+    def recv(self, timeout=1.0):
+        """Прочитать данные сокета; вернуть ВСЕ накопленные полные строки
+        одним сообщением (\\r\\n между ними), либо None если за timeout не
+        пришло НИ ОДНОГО байта.
+
+        КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ («сообщения видны только ~60-120 c, потом
+        перестают появляться, хотя в чате пишут»): раньше один вызов recv()
+        делал РОВНО ОДИН sock.recv(). При оживлённом канале Twitch отдаёт
+        трафик пачками по несколько строк; неполная «хвостовая» строка
+        оставалась в self.buf, а recv() возвращал "" (или None по таймауту).
+        Внешний цикл считал это «секундой без входящих байтов» и watchdog
+        принудительно рвал ЖИВОЕ соединение каждые ~120 c (см. логи:
+        «Watchdog: ... нет НИ ОДНОГО ответа сервера» при «любой входящий
+        пакет был: 17 c назад»). Теперь внутри одного вызова recv() мы
+        крутимся до таймаута и ЗАБИРАЕМ ВЕСЬ доступный трафик — буфер больше
+        не оставляет «висящие» байты, и watchdog видит честную картину:
+        None == сокет действительно молчал всю секунду.
+
+        Также: socket.timeout (Python <3.10) и TimeoutError (>=3.10) —
+        штатная ситуация тишины, а НЕ ошибка сокета; TimeoutError является
+        подклассом OSError, поэтому порядок except здесь принципиален.
+        """
+        deadline = time.monotonic() + timeout
+        got_any = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.sock.settimeout(remaining)
+            try:
+                chunk = self.sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                break  # таймаут — штатно, в чате/на канале тихо
+            except OSError:
+                raise  # настоящая ошибка сокета — наверх (переподключение)
+            finally:
+                # send() обязан блокироваться до отправки, а не падать по
+                # короткому read-таймауту — возвращаем бесконечный таймаут
+                self.sock.settimeout(None)
+            if not chunk:
+                raise ConnectionError("Twitch закрыл TCP-соединение")
+            got_any = True
+            self.buf += chunk
+        lines = self._extract_lines()
+        if lines:
+            return "\r\n".join(lines)
+        return None if not got_any else ""
 
     def close(self):
         try:
@@ -600,10 +606,8 @@ class TwitchChatThread(threading.Thread):
                 try:
                     msg = conn.recv(timeout=1.0)
                 except (TimeoutError, socket.timeout):
-                    # socket.timeout и TimeoutError — РАЗНЫЕ классы в разных
-                    # версиях Python (до 3.10 / с 3.10). Перехватываем оба,
-                    # иначе «таймаут» улетал в ветку ниже как ошибка соединения
-                    # и рвал живой коннект при первой же секунде тишины чата.
+                    # RawTCPClient.recv теперь сам инкапсулирует таймаут (None),
+                    # но сторонние коннекторы (websockets) могут кинуть — штатно.
                     msg = None
                 except Exception as e:
                     if type(e).__name__ in ("ConnectionClosed", "ConnectionClosedError"):
@@ -613,18 +617,10 @@ class TwitchChatThread(threading.Thread):
                     break
                 if msg is None:
                     now_w = time.time()
-                    # ВАЖНО (исправление «watchdog рвёт ЖИВОЕ соединение через
-                    # ~125 c после последнего сообщения»): recv вернул None —
-                    # за целый секундный тик из сокета не пришло НИ ОДНОГО
-                    # байта. Если таких подряд накопилось больше watchdog_s,
-                    # сокет реально молчит (half-open) — разрываем и
-                    # переподключаемся. Порог считаем по ФАКТУ молчания сокета,
-                    # а не по времени последнего ПРИВЕТСТВИЯ-строки: раньше
-                    # last_rx_wall обновлялся только непустыми возвратами recv,
-                    # и пустые ""/таймауты в живой линии искажали счётчик —
-                    # watchdog срабатывал при живом трафике (см. логи:
-                    # «любой входящий пакет был: 18 c назад» + «Watchdog: 125 c
-                    # нет НИ ОДНОГО ответа сервера»).
+                    # recv вернул None => за ПОЛНУЮ секунду из сокета не пришло
+                    # НИ ОДНОГО байта (новый recv() вычитывает весь доступный
+                    # трафик до упора, так что "висящих" байт в буфере больше
+                    # нет — см. исправление ложного срабатывания watchdog).
                     silent_ticks += 1
                     if silent_ticks > watchdog_s_static + 5:
                         log(f"[irc] Watchdog: {silent_ticks} c сокет НЕ прислал "
@@ -639,7 +635,7 @@ class TwitchChatThread(threading.Thread):
                     # сообщение чата приходит по этому же соединению. Разрыв
                     # «на всякий случай» лишь создавал окна в 5 секунд без чата.
                     # Теперь предупреждаем в лог, но сидим и ждём; разрыв
-                    # происходит только настоящим watchdog'ем ниже — если
+                    # происходит только настоящим watchdog'ем выше — если
                     # сервер перестал ОТВЕЧАТЬ на наши PING (half-open).
                     if now_w - last_rx_wall > 60 and not idle_logged_60:
                         idle_logged_60 = True
@@ -648,18 +644,15 @@ class TwitchChatThread(threading.Thread):
                         log(f"[stall] Тишина 60+ c (чат молчит или Twitch не шлёт "
                             f"PRIVMSG). Соединение НЕ рвём — ждём ответов на PING. "
                             f"Команды за соединение: {cmds}")
-                    if now_w - last_keepalive > 25:
-                        # Активный keep-alive. Шлём PING каждые 25 с + повторный
-                        # JOIN (сервер отвечает 353/366 — видно, жив ли канал).
-                        # Разрыв при молчании сокета делает watchdog ВЫШЕ (по
-                        # счётчику silent_ticks) — здесь только отправка.
+                    if now_w - last_keepalive > 30:
+                        # Активный keep-alive: PING каждые 30 c. Twitch отвечает
+                        # PONG — это обновляет rx_last_ts/last_rx_wall и
+                        # обнуляет silent_ticks, поэтому живое соединение
+                        # watchdog НЕ тронет никогда. Повторный JOIN не шлём:
+                        # он был «диагностикой», но плодил лишние JOIN/353/366
+                        # и шум в логах.
                         try:
                             send("PING :dogs-chat")
-                            for ch in channels:
-                                send(f"JOIN #{ch}")   # повторный JOIN + запрос NAMES
-                                                     # обновляет счётчик irc_cmds_seen
-                                                     # (сервер отвечает 353/366) — видно,
-                                                     # жив ли канал даже при тишине чата
                             self.last_send_ok = time.time()
                         except Exception:
                             raise  # сокет уже мёртв — наверх, переподключение
@@ -669,19 +662,6 @@ class TwitchChatThread(threading.Thread):
                     msg = msg.decode("utf-8", "replace")
                 # УЧЁТ ЛЮБОГО входящего пакета — ключевая диагностика: позволяет
                 # отличить «Twitch молчит» от «мы потеряли сообщения».
-                # ВАЖНО (исправление «watchdog рвёт ЖИВОЕ соединение через ~125 c
-                # после последнего сообщения в чате»): раньше last_rx_wall
-                # («последний ответ сервера», по которому работает watchdog)
-                # обновлялся только НЕПУСТЫМИ возвратами recv. Но RawTCPClient.recv
-                # возвращает "" и когда пришёл байт, но линия ещё не закончилась,
-                # и когда таймаут истёк при незавершённой линии в буфере. В итоге
-                # Twitch мог слать серверные PING каждые ~30 c (соединение живое,
-                # мы отвечаем PONG), а watchdog всё равно накопил 125 c «без
-                # ответа» и порвал коннект — ровно то, что видно в логах:
-                # «любой входящий пакет был: 18 c назад» + «Watchdog: 125 c нет
-                # НИ ОДНОГО ответа сервера». Любой возврат recv, кроме None
-                # (полный таймаут без данных), — доказательство входящего
-                # трафика: обновляем оба счётчика.
                 self.rx_bytes += len(msg)
                 self.rx_last_ts = time.time()
                 last_rx_wall = time.time()
