@@ -44,44 +44,73 @@
     ratio: 1,                // ширина/высота спрайта собаки (из PNG)
     _list: [],               // отсортированный список файлов (для поиска кадров)
     _frameCache: new Map(),  // "breed|pose|dir" -> массив URL кадров
+    drawnBreeds: new Set(),  // породы, для которых в assets есть свои PNG
 
     has(name) { return this.files.has(name); },
 
-    // Сколько кадров анимации нарисовано для breed+pose+dir.
-    // Ищем файлы <breed>-<pose>-<N>-<dir>.png (N = 0..8).
+    // Кадры одной породы/позы: сначала точное имя "<b>-<pose>-<N>-<dir>.png",
+    // затем свободный поиск (префикс "<b>-<pose>", N-й кадр, нужная сторона в
+    // имени — husky_walk_2_left.png тоже найдётся).
+    _poseFrames(b, pose, dir, startIdx) {
+      const urls = [];
+      const other = dir === "left" ? "right" : "left";
+      for (let i = startIdx; i <= 8; i++) {
+        const exact = b + "-" + pose + "-" + i + "-" + dir + ".png";
+        if (this.has(exact)) { urls.push("/assets/" + exact); continue; }
+        const loose = this._looseFrame(b, pose, i, dir);
+        if (loose) { urls.push(loose); continue; }
+        // старый формат без номера кадра: "<b>-<pose>-<dir>.png"
+        if (i === 0) {
+          const legacy = b + "-" + pose + "-" + dir + ".png";
+          if (this.has(legacy)) urls.push("/assets/" + legacy);
+        }
+      }
+      if (urls.length) return urls;
+      // нужной стороны нет — берём другую (applySprite отразит)
+      for (let i = startIdx; i <= 8; i++) {
+        const exact = b + "-" + pose + "-" + i + "-" + other + ".png";
+        if (this.has(exact)) { urls.push("/assets/" + exact + "?flip=1"); continue; }
+        const loose = this._looseFrame(b, pose, i, other);
+        if (loose) { urls.push(loose + "?flip=1"); continue; }
+        if (i === 0) {
+          const legacy = b + "-" + pose + "-" + other + ".png";
+          if (this.has(legacy)) urls.push("/assets/" + legacy + "?flip=1");
+        }
+      }
+      return urls;
+    },
+
+    // Свободный поиск i-го кадра позы: файл начинается с "<b>-<pose>" или
+    // "<b>_<pose>", содержит номер кадра и указанную сторону в имени.
+    // Файлы старого формата (без номера) здесь не подходят — их ловит legacy.
+    _looseFrame(b, pose, idx, dir) {
+      const rxNum = new RegExp("[-_]" + idx + "(?:\\.png|[-_])");
+      for (const f of this._list) {
+        const fl = f.toLowerCase();
+        if (!(fl.startsWith(b + "-" + pose) || fl.startsWith(b + "_" + pose))) continue;
+        if (!fl.endsWith(".png")) continue;
+        if (!rxNum.test(fl)) continue;
+        if (!fl.includes(dir)) continue;
+        return "/assets/" + f;
+      }
+      return null;
+    },
+
+    // Кадры анимации для breed+pose+dir (N = 0..8). Если у породы своих
+    // кадров нет — фолбэк к базовой собаке dog-* ("generic"), чтобы
+    // нарисованная базовая анимация работала для всех пород без PNG.
     framesFor(breed, pose, dir) {
       const key = breed + "|" + pose + "|" + dir;
       if (this._frameCache.has(key)) return this._frameCache.get(key);
       const b = String(breed).toLowerCase(), d = String(dir).toLowerCase();
-      const rx = new RegExp("^" + b + "[-_]" + pose + "[-_](\\d)[-_]" + d + "\\.png$");
-      let best = null, bestOther = null;
-      for (const f of this._list) {
-        const m = rx.exec(f.toLowerCase());
-        if (!m) continue;
-        const n = parseInt(m[1], 10);
-        if (n === 0) best = true; else bestOther = true;
+      let urls = this._poseFrames(b, pose, d, 0);
+      if (!urls.length && pose !== "idle") urls = this._poseFrames(b, "idle", d, 0);
+      if (!urls.length && b !== "dog") {
+        urls = this._poseFrames("dog", pose, d, 0);
+        if (!urls.length && pose !== "idle") urls = this._poseFrames("dog", "idle", d, 0);
       }
-      // если side-файлов нет — годятся и файлы без указания стороны не нужны:
-      // зеркалим через spriteFor, поэтому считаем кадры по обеим сторонам вместе
-      const any = best || bestOther;
-      const urls = [];
-      if (any) {
-        for (let i = 0; i <= 8; i++) {
-          const name = b + "-" + pose + "-" + i + "-" + dir + ".png";
-          if (this.has(name)) urls.push("/assets/" + name);
-        }
-        // если нужной стороны нет, берём другую сторону (applySprite отразит)
-        if (!urls.length) {
-          const other = dir === "left" ? "right" : "left";
-          for (let i = 0; i <= 8; i++) {
-            const name = b + "-" + pose + "-" + i + "-" + other + ".png";
-            if (this.has(name)) urls.push("/assets/" + name + "?flip=1");
-          }
-        }
-      }
-      const res = urls;
-      this._frameCache.set(key, res);
-      return res;
+      this._frameCache.set(key, urls);
+      return urls;
     },
 
     async load() {
@@ -128,10 +157,11 @@
 
   // первая доступная png собаки — для замера пропорций спрайта
   function firstDogPng() {
-    const order = ["dog-idle-right.png", "dog-walk-right.png"];
+    const order = ["dog-idle-0-right.png", "dog-idle-right.png",
+                   "dog-walk-0-right.png", "dog-walk-right.png"];
     for (const n of order) if (Assets.has(n)) return n;
     for (const n of [...Assets.files].sort()) {
-      if (n.endsWith(".png") && !/^kennel/.test(n) && /-(idle|walk|run|sleep)-/.test(n)) return n;
+      if (n.endsWith(".png") && !/^kennel/.test(n) && /-(idle|walk|run|sleep)/.test(n)) return n;
     }
     return "dog-idle-right.png";
   }
@@ -186,12 +216,21 @@
     for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
     return h;
   }
+  // Есть ли у породы собственные PNG в assets? Если нет — заводим её как
+  // "generic": движок сам фолбэкнется на базовую собаку dog-* (или emoji).
+  // Порода считается нарисованной, если есть файл "<breed>-..." или любой
+  // файл с именем породы (нестандартные имена автора тоже годятся).
+  function isBreedDrawn(breed) {
+    if (Assets.drawnBreeds.has(breed)) return true;
+    const b = String(breed).toLowerCase();
+    return [...Assets.files].some((f) => f.toLowerCase().includes(b));
+  }
   // login -> имя породы (стабильно между перезагрузками страницы/сервера)
   function breedNameFor(login, mod) {
     const key = String(login).toLowerCase();
-    if (mod) return MOD_BREEDS[hashStr(key) % MOD_BREEDS.length];
-    const names = Object.keys(BREEDS);
-    return names[hashStr(key) % names.length];
+    const names = mod ? MOD_BREEDS : Object.keys(BREEDS);
+    const pick = names[hashStr(key) % names.length];
+    return isBreedDrawn(pick) ? pick : "generic";
   }
   // login -> emoji заглушки (пока PNG этой породы не нарисованы)
   function breedEmoji(login, mod) {
@@ -243,10 +282,14 @@
     const base = [
       ["dog-" + pose + "-" + dir + ".png", false],
       ["dog-" + pose + "-" + other + ".png", true],
+      ["dog-" + pose + "-0-" + dir + ".png", false],   // 1-кадровая схема
+      ["dog-" + pose + "-0-" + other + ".png", true],
     ];
     if (pose !== "idle") {
       base.push(["dog-idle-" + dir + ".png", false]);
       base.push(["dog-idle-" + other + ".png", true]);
+      base.push(["dog-idle-0-" + dir + ".png", false]);
+      base.push(["dog-idle-0-" + other + ".png", true]);
     }
     for (const [f, flip] of base) {
       if (Assets.has(f)) return { url: "/assets/" + f, flip };
