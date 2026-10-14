@@ -62,6 +62,8 @@ DEFAULT_CONFIG = {
     "refresh_ui_seconds": 5,           # как часто пушить обновление в UI
     "max_dogs": 60,                    # максимум собак на экране
     "nickname": "",                    # ник для IRC (пусто = justinfan random)
+    "oauth_token": "",                 # опционально: oauth:... токен чата (для привилегированного чтения)
+    "irc_transport": "",               # ""/auto|tcp|ws — приоритет транспорта IRC (см. _open_conn)
     "http_port": 8377,
     "http_host": "127.0.0.1",          # 0.0.0.0 — если сервер на ВМ, а OBS на другой машине
 }
@@ -341,6 +343,7 @@ class TwitchChatThread(threading.Thread):
         self.store = store
         self.config = config
         self.stop_event = threading.Event()
+        self.last_transport = "?"   # фактический транспорт текущего соединения (для лога)
 
     def run(self):
         channels = [c.strip().lstrip("#").lower() for c in self.config.get("channels", []) if c.strip()]
@@ -367,33 +370,52 @@ class TwitchChatThread(threading.Thread):
 
     def _open_conn(self):
         """Открыть соединение. Надёжный порядок: TCP-IRC (6667) без зависимостей,
-        затем WebSocket (sync/async). Первый успешный вариант используется до обрыва."""
+        затем WebSocket (sync/async). Первый успешный вариант используется до обрыва.
+
+        ВАЖНО: WS идёт в списке ПОСЛЕ TCP и является резервным — на некоторых
+        IP/провайдерах TMI молча закрывает WebSocket-соединение сразу после
+        рукопожатия (0 сообщений), тогда как TCP 6667 работает стабильно.
+        Порядок можно задать в settings.json: "irc_transport": "tcp"|"ws"
+        (пусто/нет ключа = автоопределение по этому списку)."""
         errors = []
+        order = (self.config.get("irc_transport") or "").strip().lower()
+        want_tcp = order in ("", "tcp", "auto")
+        want_ws = order in ("", "ws", "auto")
+        if order not in ("", "tcp", "ws", "auto"):
+            log(f"[irc] Неизвестный irc_transport='{order}', использую авто")
+
         # Вариант 1: чистый TCP IRC на порт 6667 — не требует websockets и
         # устойчив к тому, что Twitch режет WS-трафик по HTTP-признакам.
-        try:
-            return RawTCPClient("irc.chat.twitch.tv", 6667)
-        except Exception as e:
-            errors.append(f"tcp6667: {type(e).__name__}: {e}")
+        if want_tcp:
+            try:
+                conn = RawTCPClient("irc.chat.twitch.tv", 6667)
+                self.last_transport = "TCP 6667"
+                return conn
+            except Exception as e:
+                errors.append(f"tcp6667: {type(e).__name__}: {e}")
         # Вариант 2: WebSocket через установленную библиотеку websockets
-        if HAS_WEBSOCKETS:
+        if want_ws and HAS_WEBSOCKETS:
             try:
                 import websockets.sync.client as sc
-                return sc.connect(TWITCH_WS_URL, open_timeout=15)
+                conn = sc.connect(TWITCH_WS_URL, open_timeout=15)
+                self.last_transport = "WebSocket wss://443"
+                return conn
             except ImportError:
                 try:
-                    return self._async_connect_fallback()
+                    conn = self._async_connect_fallback()
+                    self.last_transport = "WebSocket wss://443 (async)"
+                    return conn
                 except Exception as e:
                     errors.append(f"ws-async: {type(e).__name__}: {e}")
             except Exception as e:
                 errors.append(f"ws-sync: {type(e).__name__}: {e}")
-        else:
+        elif want_ws and not HAS_WEBSOCKETS:
             errors.append("websockets: библиотека не установлена")
         raise ConnectionError("Не удалось подключиться ни одним способом -> " + " | ".join(errors))
 
     def _connect_and_read(self, nick: str, channels: list):
         conn = self._open_conn()
-        is_tcp = isinstance(conn, RawTCPClient)
+
         with conn:
             def send(s):
                 conn.send(s.encode() if isinstance(s, str) else s)
@@ -411,7 +433,7 @@ class TwitchChatThread(threading.Thread):
             send("CAP REQ :twitch.tv/tags twitch.tv/commands")
             for ch in channels:
                 send(f"JOIN #{ch}")
-            log(f"[irc] Подключено ({'TCP 6667' if is_tcp else 'WebSocket'}). Каналы: {', '.join(channels)}")
+            log(f"[irc] Подключено ({self.last_transport}). Каналы: {', '.join(channels)}")
             got_msgs = 0
             last_keepalive = time.time()
             while not self.stop_event.is_set():
