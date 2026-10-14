@@ -116,7 +116,7 @@ html, body {
  * ВАЖНО: подпись лежит ВНУТРИ карточки собаки (.dog имеет overflow:visible),
  * поэтому не обрезается ни зоной выгула, ни краем экрана. */
 .name {
-  position: absolute; bottom: 100%; left: 50%; transform: translate(-50%, -2px);
+  position: absolute; top: -13px; left: 50%; transform: translate(-50%, -2px);
   font-size: 12px; font-weight: 700; color: #ffffff;
   white-space: nowrap; pointer-events: none; line-height: 1;
   text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 6px rgba(0,0,0,.7);
