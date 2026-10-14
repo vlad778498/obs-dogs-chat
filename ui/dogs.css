@@ -36,7 +36,11 @@ html, body {
 #kennel {
   position: absolute; right: 16px; bottom: var(--ground);
   height: var(--kennel-h); width: auto; aspect-ratio: var(--kennel-ar, 1.5);
-  z-index: 5; pointer-events: none;
+  /* z-index: 2 — будка ПОД зоной собак (#yard, z-index:3) и под крышей
+ * с модераторами (#mod-roost, z-index:6): собаки гуляют ПЕРЕД конурой,
+ * но модераторы на крыше остаются поверх голов проходящих собак.
+ * Если хотите наоборот — верните 5. */
+  z-index: 2; pointer-events: none;
 }
 /* CSS-заглушка будки, пока kennel.png не нарисован */
 #kennel:not(.has-art)::before { content: ""; position: absolute; inset: 0; z-index: -1; }
