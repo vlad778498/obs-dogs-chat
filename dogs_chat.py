@@ -354,6 +354,13 @@ class TwitchChatThread(threading.Thread):
         self.last_msg_ts = None        # время последнего принятого сообщения
         self.last_ping_pong = None     # время последнего PONG на серверный PING
         self.last_alive_log = 0.0      # когда последний раз печатали [alive]
+        # --- расширенная диагностика (коммит 9d34f0e, которого не было в репо) ---
+        self.rx_bytes = 0              # байт принято за текущее соединение
+        self.rx_lines = 0              # строк получено за текущее соединение
+        self.rx_last_ts = None         # когда пришёл ЛЮБОЙ пакет (не только PRIVMSG)
+        self.my_pongs = 0              # сколько раз мы ответили PONG на PING сервера
+        self.server_pings = 0          # сколько PING прислал сервер
+        self.last_privmsg_line = ""    # последняя полная строка PRIVMSG (для лога)
 
     def run(self):
         channels = [c.strip().lstrip("#").lower() for c in self.config.get("channels", []) if c.strip()]
@@ -426,7 +433,12 @@ class TwitchChatThread(threading.Thread):
     def _log_alive(self, force=False):
         """Каждые 120 секунд писать в journal сводку: живо ли соединение и
         идут ли сообщения. Если что-то из этого перестанет работать — будет
-        видно НЕВОЗМОЖНО пропустить прямо в `journalctl -u dogs-chat -f`."""
+        видно НЕВОЗМОЖНО пропустить прямо в `journalctl -u dogs-chat -f`.
+
+        ВАЖНОЕ ДОПОЛНЕНИЕ: раньше по логу нельзя было отличить «Twitch молчит»
+        (нет сообщений в чате / сервер не шлёт трафик) от «наш код потерял
+        сообщения». Теперь пишутся раздельно: любой входящий пакет [diag] и
+        каждое принятое сообщение чата [msg]."""
         now = time.time()
         if not force and now - self.last_alive_log < 120:
             return
@@ -437,11 +449,18 @@ class TwitchChatThread(threading.Thread):
         age = int(now - self.connected_at)
         since_msg = "-" if self.last_msg_ts is None else f"{int(now - self.last_msg_ts)} c назад"
         since_pp = "-" if self.last_ping_pong is None else f"{int(now - self.last_ping_pong)} c назад"
+        since_rx = "-" if self.rx_last_ts is None else f"{int(now - self.rx_last_ts)} c назад"
         active = self.store.total_active()
         log(f"[alive] Соединение #{self.conn_id} ({self.last_transport}) активно {age} c; "
             f"PRIVMSG за это соединение: {self.msgs_this_conn} (всего {self.total_msgs}); "
             f"последнее сообщение: {since_msg}; последний PONG на PING сервера: {since_pp}; "
             f"активных чатеров сейчас: {active}")
+        log(f"[diag] За соединение #{self.conn_id}: байт принято {self.rx_bytes}, строк {self.rx_lines}; "
+            f"любой входящий пакет был: {since_rx}; PING от сервера: {self.server_pings}, "
+            f"наших PONG: {self.my_pongs}. "
+            + ("ВЫВОД: Twitch НЕ присылает нам трафик (см. [msg]/[diag]) — причина вне нашего кода."
+               if self.rx_last_ts is None or now - self.rx_last_ts > 60
+               else "ВЫВОД: пакеты от Twitch приходят — если чатеров нет, значит в чате тихо или теряются PRIVMSG."))
 
     def _connect_and_read(self, nick: str, channels: list):
         conn = self._open_conn()
@@ -468,6 +487,11 @@ class TwitchChatThread(threading.Thread):
             self.conn_id += 1
             self.connected_at = time.time()
             self.msgs_this_conn = 0
+            self.rx_bytes = 0
+            self.rx_lines = 0
+            self.rx_last_ts = None
+            self.server_pings = 0
+            self.my_pongs = 0
             self._log_alive(force=True)   # сразу при подключении — видно, что всё поднялось
             got_msgs = 0
             last_keepalive = time.time()
@@ -502,14 +526,23 @@ class TwitchChatThread(threading.Thread):
                     continue
                 if isinstance(msg, bytes):
                     msg = msg.decode("utf-8", "replace")
+                # УЧЁТ ЛЮБОГО входящего пакета — ключевая диагностика: позволяет
+                # отличить «Twitch молчит» от «мы потеряли сообщения».
+                self.rx_bytes += len(msg)
+                self.rx_last_ts = time.time()
                 # PING от сервера может прийти в любом сообщении — отвечаем сразу,
                 # иначе Twitch закрывает молчаливое соединение (~через минуту)
                 if "PING" in msg:
                     for line in msg.split("\r\n"):
                         if line.startswith("PING"):
                             send("PONG :tmi.twitch.tv")
+                            self.server_pings += 1
+                            self.my_pongs += 1
                             self.last_ping_pong = time.time()
                 for line in msg.split("\r\n"):
+                    if not line.strip():
+                        continue
+                    self.rx_lines += 1
                     if line.startswith("PING"):
                         continue  # уже обработано выше
                     # служебные сообщения пишем в лог — по ним видно,
@@ -531,6 +564,12 @@ class TwitchChatThread(threading.Thread):
                         self.total_msgs += 1
                         self.msgs_this_conn += 1
                         self.last_msg_ts = time.time()
+                        self.last_privmsg_line = line[:200]
+                        # каждое принятое сообщение — одной строкой в journal.
+                        # Если чатерс пишет, а собаки не появляются — здесь он
+                        # виден, значит проблема дальше по коду; если строк
+                        # [msg] нет вовсе — до нас не доходит трафик от Twitch.
+                        log(f"[msg] {login}: {(trailing or '')[:60]}")
                         self.store.touch(login, tags.get("display-name", nick_user),
                                          tags.get("color", ""), is_mod=is_mod)
             log(f"[irc] Поток чата остановлен. Принято сообщений за это соединение: {got_msgs}.")
