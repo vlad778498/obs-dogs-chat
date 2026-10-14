@@ -494,18 +494,27 @@ class TwitchChatThread(threading.Thread):
             # "PASS " (без токена) злит соединение без ответа, а анонимный вход
             # justinfan* работает только вообще без PASS. PASS шлём ТОЛЬКО если
             # в settings.json задан oauth_token.
-            send(f"NICK {nick}")
             token = (self.config.get("oauth_token") or "").strip()
             # Допускаем в settings.json любой из форматов, которые люди
             # копируют из генераторов токенов: "abc123...", "oauth:abc123..."
-            # или "password=oauth:abc123..." (формат чужих сниппетов) —
-            # приводим к каноническому PASS oauth:<токен>.
+            # или "password=oauth:abc123..." (формат чужих сниппетов).
             if token.lower().startswith("password="):
                 token = token.split("=", 1)[1].strip()
-            if token and not token.lower().startswith("oauth:"):
-                token = "oauth:" + token
+            if token.lower().startswith("oauth:"):
+                token = token[len("oauth:"):].strip()
+            # Порядок NICK/PASS/CAP. Для авторизованного входа шлём строго
+            # PASS -> NICK -> CAP REQ: проверено живым тестом против
+            # irc.chat.twitch.tv:6667 — только в этом порядке Twitch принимает
+            # токен; при NICK раньше PASS сервер успевает зарегистрировать
+            # соединение как анонимное и отвечает
+            # "NOTICE * :Improperly formatted auth".
+            # Для анонимного входа PASS вообще не отправляем — пустая строка
+            # "PASS " злит соединение без ответа (тоже проверено вживую).
             if token:
-                send(f"PASS {token}")
+                send(f"PASS oauth:{token}")
+                send(f"NICK {nick}")
+            else:
+                send(f"NICK {nick}")
             send("CAP REQ :twitch.tv/tags twitch.tv/commands")
             for ch in channels:
                 send(f"JOIN #{ch}")
@@ -607,13 +616,30 @@ class TwitchChatThread(threading.Thread):
                         log(f"[irc>] {line.strip()}")
                         # частая причина «сервис работает, а чата нет»: неверная
                         # авторизация. Объясняем по-человечески, что исправить.
-                        if "Improperly formatted auth" in line:
-                            log("[irc] ВНИМАНИЕ: Twitch отверг авторизацию. Проверьте в "
-                                "settings.json: 1) oauth_token — только сам токен без "
-                                "префикса 'oauth:'; 2) nickname — ЛОГИН того аккаунта, на "
-                                "который выпущен токен (регистр не важен). Если токен "
-                                "сомнительный — уберите oauth_token и nickname: сервис "
-                                "перейдёт на анонимный вход justinfan*.")
+                        if "Improperly formatted auth" in line or "Login authentication failed" in line:
+                            # Разворачиваем причину по фактическим данным конфига —
+                            # пользователю не надо гадать, что именно не так.
+                            tok = (self.config.get("oauth_token") or "").strip()
+                            nk = (self.config.get("nickname") or "").strip()
+                            reasons = []
+                            if not tok:
+                                reasons.append("oauth_token пустой")
+                            else:
+                                core = tok.split("=", 1)[-1].replace("oauth:", "").strip()
+                                if len(core) != 30 or not core.isalnum():
+                                    reasons.append(
+                                        f"oauth_token выглядит неверно (длина {len(core)}, "
+                                        "нужно 30 букв/цифр без префиксов)")
+                            if tok and not nk:
+                                reasons.append("пустой nickname (должен быть логин владельца токена)")
+                            log("[irc] ВНИМАНИЕ: Twitch отверг авторизацию."
+                                + (" Возможные причины: " + "; ".join(reasons) + "." if reasons else
+                                   " Токен формально корректен, но сервер его не принимает: "
+                                   "скорее всего он выпущен БЕЗ scope chat:read, для другого "
+                                   "client id, просрочен или отозван.")
+                                + " Что делать: перегенерируйте токен со scope chat:read для "
+                                  "аккаунта из nickname; либо удалите oauth_token/nickname — "
+                                  "сервис перейдёт на анонимный вход justinfan*.")
                     parsed = parse_irc_line(line)
                     if not parsed:
                         continue
