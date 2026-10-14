@@ -10,8 +10,10 @@
  *   - сервер отдаёт список файлов из ui/assets через /api/assets;
  *   - клиент определяет, какие PNG уже нарисованы, и переключается на них
  *     автоматически (до этого — эмодзи-заглушки);
- *   - анимация "в пару кадров": idle/walk меняются местами каждые
- *     frame_duration_ms из assets/frame-duration.txt;
+ *   - покадровая анимация: для позы ищутся файлы с номером кадра
+ *     (<breed>-walk-0-right.png, -1-, -2- ... до 8), меняются каждые
+ *     frame_duration_ms из assets/frame-duration.txt; если кадров нет —
+ *     используется безымянный файл (старая двухкадровая схема);
  *   - ориентация: файлы с суффиксом -right/-left используются как есть,
  *     если left-версии нет — right-спрайт зеркалится CSS-ом;
  *   - размеры на экране задаются в CSS (--dog-size, --kennel-w),
@@ -40,14 +42,55 @@
     kennelArt: false,        // есть ли kennel.png
     runArt: false,           // отдельный кадр бега (опционально)
     ratio: 1,                // ширина/высота спрайта собаки (из PNG)
+    _list: [],               // отсортированный список файлов (для поиска кадров)
+    _frameCache: new Map(),  // "breed|pose|dir" -> массив URL кадров
 
     has(name) { return this.files.has(name); },
+
+    // Сколько кадров анимации нарисовано для breed+pose+dir.
+    // Ищем файлы <breed>-<pose>-<N>-<dir>.png (N = 0..8).
+    framesFor(breed, pose, dir) {
+      const key = breed + "|" + pose + "|" + dir;
+      if (this._frameCache.has(key)) return this._frameCache.get(key);
+      const b = String(breed).toLowerCase(), d = String(dir).toLowerCase();
+      const rx = new RegExp("^" + b + "[-_]" + pose + "[-_](\\d)[-_]" + d + "\\.png$");
+      let best = null, bestOther = null;
+      for (const f of this._list) {
+        const m = rx.exec(f.toLowerCase());
+        if (!m) continue;
+        const n = parseInt(m[1], 10);
+        if (n === 0) best = true; else bestOther = true;
+      }
+      // если side-файлов нет — годятся и файлы без указания стороны не нужны:
+      // зеркалим через spriteFor, поэтому считаем кадры по обеим сторонам вместе
+      const any = best || bestOther;
+      const urls = [];
+      if (any) {
+        for (let i = 0; i <= 8; i++) {
+          const name = b + "-" + pose + "-" + i + "-" + dir + ".png";
+          if (this.has(name)) urls.push("/assets/" + name);
+        }
+        // если нужной стороны нет, берём другую сторону (applySprite отразит)
+        if (!urls.length) {
+          const other = dir === "left" ? "right" : "left";
+          for (let i = 0; i <= 8; i++) {
+            const name = b + "-" + pose + "-" + i + "-" + other + ".png";
+            if (this.has(name)) urls.push("/assets/" + name + "?flip=1");
+          }
+        }
+      }
+      const res = urls;
+      this._frameCache.set(key, res);
+      return res;
+    },
 
     async load() {
       try {
         const r = await fetch("/api/assets", { cache: "no-store" });
         const j = await r.json();
         this.files = new Set(j.files || []);
+        this._list = [...this.files].sort();
+        this._frameCache.clear();
         this.frameMs = j.frame_duration_ms || 250;
       } catch (e) { /* сеть ещё не готова — останутся заглушки */ }
 
@@ -56,7 +99,7 @@
       this.dogArt = pngs.some((f) => /^(dog|labrador|shepherd|husky|poodle|corgi|beagle|bulldog|dalmatian|greyhound|pug)-/.test(f));
       this.modArt = pngs.some((f) => /^mod-/.test(f));
       this.kennelArt = this.has("kennel.png");
-      this.runArt = pngs.some((f) => /-run-(left|right)\.png$/.test(f));
+      this.runArt = pngs.some((f) => /-run(-\d)?-(left|right)\.png$/.test(f));
 
       kennel.classList.toggle("has-art", this.kennelArt);
       renderPlaceholderKennel();
@@ -211,8 +254,16 @@
     return null; // -> emoji-заглушка
   }
 
+  // spriteEl.dataset.sprite хранит "breed|pose|dir" — по нему выбираем кадр,
+  // чтобы при смене собаки не сбрасывать счётчик анимации.
   function applySprite(spriteEl, holderEl, breed, pose, dir, tintCss) {
-    const s = spriteFor(breed, pose, dir);
+    const frames = Assets.framesFor(breed, pose, dir);
+    let s;
+    if (frames.length) {
+      s = { url: frames[0], flip: /\?flip=1$/.test(frames[0]) };
+    } else {
+      s = spriteFor(breed, pose, dir);
+    }
     if (!s) {
       holderEl.classList.add("placeholder");
       spriteEl.style.backgroundImage = "";
@@ -222,6 +273,8 @@
     }
     holderEl.classList.remove("placeholder");
     spriteEl.textContent = "";
+    spriteEl.dataset.sprite = breed + "|" + pose + "|" + dir;
+    spriteEl.dataset.frames = JSON.stringify(frames);
     spriteEl.style.backgroundImage = 'url("' + s.url + '")';
     // собственное зеркало только когда файл отражён относительно нужной стороны
     spriteEl.style.transform = s.flip ? "scaleX(-1)" : "";
@@ -303,40 +356,63 @@
   setInterval(tickWalk, WALK_TICK);
 
   // =========================================================================
-  // Анимация в пару кадров: глобальный таймер, все собаки синхронно
+  // Покадровая анимация: глобальный счётчик кадров, все собаки синхронно.
+  // Для позы с нарисованными кадрами (0..N) проигрывается вся цепочка;
+  // для старой двухкадровой схемы — idle/walk чередуются как раньше.
   // =========================================================================
-  let frameToggle = false;
+  let frameToggle = false;   // compat: старая схема из двух безымянных файлов
+  let globalFrame = 0;       // номер текущего кадра многокадровой анимации
   function startFrameTimer() {
     // пересоздаём интервал при перезагрузке ассетов (мог измениться frame-duration.txt)
     if (startFrameTimer._t) clearInterval(startFrameTimer._t);
     startFrameTimer._t = setInterval(() => {
       frameToggle = !frameToggle;
+      globalFrame++;
       for (const [, d] of dogs) { if (!d.leaving) updateDogFrame(d); }
       for (const [, el] of mods) {
         const st = el._st || {};
-        const hasModWalk = [...Assets.files].some((f) => /^mod-walk-(left|right)\.png$/.test(f));
+        const hasModWalk = [...Assets.files].some((f) => /^mod-walk(-\d)?-(left|right)\.png$/.test(f));
         const pose = frameToggle && hasModWalk ? "walk" : "idle";
         if (st.pose !== pose) {
           st.pose = pose; el._st = st;
           applySprite(el.querySelector(".sprite"), el, st.breed || "shepherd", pose, "right", st.tint);
+        } else {
+          advanceFrames(el.querySelector(".sprite"));
         }
       }
     }, Math.max(60, Assets.frameMs || 250));
   }
 
+  // Продвинуть спрайт к следующему кадру его текущей анимации
+  function advanceFrames(spriteEl) {
+    if (!spriteEl) return;
+    let frames = [];
+    try { frames = JSON.parse(spriteEl.dataset.frames || "[]"); } catch (e) {}
+    if (frames.length < 2) return;                    // одиночный кадр — нечего листать
+    const idx = globalFrame % frames.length;
+    const url = frames[idx];
+    spriteEl.style.backgroundImage = 'url("' + url + '")';
+    spriteEl.style.transform = /\?flip=1$/.test(url) ? "scaleX(-1)" : "";
+  }
+
   function updateDogFrame(d) {
     const moving = Math.abs(d.target - d.x) > 2;
-    const hasWalk = [...Assets.files].some((f) => /-walk-(left|right)\.png$/.test(f));
+    const hasWalk = [...Assets.files].some((f) => /-walk(-\d)?-(left|right)\.png$/.test(f));
     let pose;
     if (!moving) pose = "idle";
     else if (!hasWalk) pose = "idle";                  // walk-кадров нет — без дёрганья
     else if (d.running && Assets.runArt) pose = "run";
-    else pose = frameToggle ? "walk" : "idle";         // переключение в пару кадров
+    else pose = frameToggle ? "walk" : "idle";         // compat: пара безымянных файлов
     const dir = d.faceLeft ? "left" : "right";
     const st = d.st || (d.st = {});
-    if (st.pose === pose && st.dir === dir) return;
+    const key = st.breed + "|" + pose + "|" + dir;
+    if (st.pose === pose && st.dir === dir && d.spriteEl.dataset.sprite === key) {
+      advanceFrames(d.spriteEl);                       // поза та же — листаем кадры
+      return;
+    }
     st.pose = pose; st.dir = dir;
     applySprite(d.spriteEl, d.el, st.breed || "mutt", pose, dir, st.tint);
+    advanceFrames(d.spriteEl);                         // встать в общий поток анимации
   }
 
   // =========================================================================
