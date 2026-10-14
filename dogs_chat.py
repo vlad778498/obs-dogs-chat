@@ -246,18 +246,35 @@ class RawTCPClient:
         self.sock.sendall(data.encode("utf-8"))
 
     def recv(self, timeout=1.0):
+        """Вернуть ВСЕ накопленные полные строки одним сообщением (\\r\\n между ними).
+
+        Важно: раньше возвращалась одна строка за вызов, и PING мог «залежаться»
+        в буфере, пока мы его не дочитаем, — Twitch закрывал соединение за
+        молчание (ConnectionReset сразу после подключения при оживлённом канале).
+        Теперь читаем всё доступное и отдаём целиком, чтобы PING обрабатывался
+        немедленно."""
         self.sock.settimeout(timeout)
         try:
             chunk = self.sock.recv(65536)
         except socket.timeout:
+            # таймаут истёк, но в буфере могли остаться полные линии — отдадим их
+            if b"\n" in self.buf:
+                out, self.buf = self.buf, b""
+                return out.decode("utf-8", "replace")
             return None
         if not chunk:
             raise ConnectionError("Twitch закрыл TCP-соединение")
         self.buf += chunk
         if b"\n" not in self.buf:
             return ""  # линии пока нет — подождём следующий chunk
-        out, self.buf = self.buf.split(b"\n", 1)
-        return out.decode("utf-8", "replace").rstrip("\r")
+        # делим так, чтобы последний НЕЗАВЕРШЁННЫЙ фрагмент остался в буфере
+        parts = self.buf.split(b"\n")
+        self.buf = parts.pop()  # хвост без \n (может быть b"")
+        lines = [p.rstrip(b"\r") for p in parts]
+        while lines and not lines[-1].strip():
+            lines.pop()  # не отдаём пустые хвосты (split по \r\n даёт "")
+        return ("\r\n".join(l.decode("utf-8", "replace") for l in lines)
+                if lines else "")
 
     def close(self):
         try:
@@ -380,19 +397,23 @@ class TwitchChatThread(threading.Thread):
         with conn:
             def send(s):
                 conn.send(s.encode() if isinstance(s, str) else s)
-            # Порядок критичен: NICK -> PASS -> CAP REQ. Без PASS (даже пустого
-            # для justinfan-бота) Twitch закрывает соединение до JOIN.
+            # Порядок: NICK -> CAP REQ -> JOIN. Пустой PASS не отправляем —
+            # проверено живым тестом против irc.chat.twitch.tv:6667: строка
+            # "PASS " (без токена) злит соединение без ответа, а анонимный вход
+            # justinfan* работает только вообще без PASS. PASS шлём ТОЛЬКО если
+            # в settings.json задан oauth_token.
             send(f"NICK {nick}")
             token = self.config.get("oauth_token", "")
             if token and not token.startswith("oauth:"):
                 token = "oauth:" + token
-            send(f"PASS {token}" if token else "PASS ")
+            if token:
+                send(f"PASS {token}")
             send("CAP REQ :twitch.tv/tags twitch.tv/commands")
             for ch in channels:
                 send(f"JOIN #{ch}")
             log(f"[irc] Подключено ({'TCP 6667' if is_tcp else 'WebSocket'}). Каналы: {', '.join(channels)}")
             got_msgs = 0
-            last_join_check = time.time()
+            last_keepalive = time.time()
             while not self.stop_event.is_set():
                 try:
                     msg = conn.recv(timeout=1.0)
@@ -405,10 +426,16 @@ class TwitchChatThread(threading.Thread):
                     log(f"[irc] Соединение потеряно: {type(e).__name__}: {e}. Переподключение...")
                     break
                 if msg is None:
-                    if time.time() - last_join_check > 300:
-                        for ch in channels:
-                            send(f"JOIN #{ch}")
-                        last_join_check = time.time()
+                    if time.time() - last_keepalive > 25:
+                        # активный keep-alive: Twitch закрывает соединение, если
+                        # от нас долго нет ни PONG, ни JOIN. Периодический повторный
+                        # JOIN безвреден (сервер ответит "already in channel").
+                        try:
+                            for ch in channels:
+                                send(f"JOIN #{ch}")
+                        except Exception:
+                            raise  # сокет уже мёртв — наверх, переподключение
+                        last_keepalive = time.time()
                     continue
                 if isinstance(msg, bytes):
                     msg = msg.decode("utf-8", "replace")
