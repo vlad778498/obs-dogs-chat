@@ -293,6 +293,15 @@ class RawTCPClient:
         self.close()
 
 
+# Максимально допустимый простой БЕЗ ЛЮБОГО входящего пакета от сервера.
+# После него соединение считается мёртвым (см. watchdog в _connect_and_read).
+# Twitch держит idle-соединения живыми и слал PING примерно раз в минуту;
+# отсутствие любых байтов 75+ секунд почти гарантированно означает, что
+# обратный путь потерялся. Значение можно переопределить в settings.json:
+# "irc_watchdog_seconds".
+WATCHDOG_S_DEFAULT = 75
+
+
 def parse_tags(raw_tags: str) -> dict:
     from urllib.parse import unquote
     tags = {}
@@ -364,6 +373,15 @@ class TwitchChatThread(threading.Thread):
         self.irc_cmds_seen = {}        # счётчик всех IRC-команд от сервера за соединение
                                        # (JOIN/PART/NAMES/353/NOTICE/PRIVMSG...) — по нему
                                        # видно, жив ли канал и что именно шлёт Twitch
+        # --- сторожевой таймер (watchdog) ---
+        # Когда последний раз УСПЕШНО отправили что-либо в сокет. Если Twitch
+        # тихо убивает TCP-соединение (half-open: от нас принимают, нам не
+        # шлют), то send() на живом сокете НЕ бросает исключение и молча
+        # «успешен» бесконечно — поэтому просто PING каждые 25 c проблему не
+        # лечат. Единственный честный признак жизни — подтверждение от сервера
+        # (любой входящий пакет). Если его нет дольше WATCHDOG_S секунд, рвём
+        # сокет принудительно (close -> recv кинет ошибку -> переподключение).
+        self.last_send_ok = None
 
     def run(self):
         channels = [c.strip().lstrip("#").lower() for c in self.config.get("channels", []) if c.strip()]
@@ -534,6 +552,9 @@ class TwitchChatThread(threading.Thread):
             last_keepalive = time.time()
             last_rx_wall = time.time()      # когда был ЛЮБОЙ входящий байт (wall clock)
             idle_logged_60 = False          # чтобы [stall] не повторялся каждую секунду
+            self.last_send_ok = time.time()
+            # сколько подряд keep-alive циклов прошли без ЛЮБОГО ответа сервера
+            unconfirmed = 0
             while not self.stop_event.is_set():
                 self._log_alive()          # раз в 2 минуты строчка [alive] в journal
                 try:
@@ -567,13 +588,26 @@ class TwitchChatThread(threading.Thread):
                         log(f"[stall] ВНИМАНИЕ: 60+ c нет НИ ОДНОГО пакета от Twitch. "
                             f"Команды за соединение были: {cmds}")
                     if now_w - last_keepalive > 25:
-                        # Активный keep-alive. Раньше тут был повторный JOIN
-                        # («already in channel» безвреден) — но многие NAT/файрволы
-                        # НЕ считают IRC-трафик «активным», если это не PING/PONG
-                        # (стандартные коннектор NAT отслеживают именно эти команды),
-                        # и тихо рвут «безразличный» коннект ровно через ~120 секунд
-                        # симметричного таймаута. Теперь шлём собственный PING —
-                        # на него реагируют и NAT, и сервер (ответным PING -> PONG).
+                        # Активный keep-alive + СТОРОЖЕВОЙ ТАЙМЕР.
+                        # Шлём PING и повторный JOIN; нормальный сервер обязан
+                        # ответить (на PING своим PING, на JOIN — 353/366 или
+                        # NOTICE "already in channel"). Если с момента
+                        # последнего ВХОДЯЩЕГО пакета прошло больше WATCHDOG_S
+                        # — соединение half-open (Twitch тихо убит, NAT съел
+                        # обратный путь и т.п.), и send() этого не заметит:
+                        # запись в мёртвый TCP-сокет «успешна». Поэтому рвём
+                        # сокет сами — recv бросит ошибку, цикл переподнимется.
+                        since_rx2 = now_w - last_rx_wall
+                        watchdog_s = max(40, int(self.config.get(
+                            "irc_watchdog_seconds", WATCHDOG_S_DEFAULT)))
+                        if since_rx2 > watchdog_s:
+                            log(f"[irc] Watchdog: {int(since_rx2)} c нет НИ ОДНОГО "
+                                f"ответа сервера (последняя попытка PING была "
+                                f"подтверждена? {'нет' if unconfirmed else 'да'}). "
+                                f"Соединение мертво — принудительный разрыв и "
+                                f"переподключение.")
+                            conn.close()
+                            break
                         try:
                             send("PING :dogs-chat")
                             for ch in channels:
@@ -581,8 +615,14 @@ class TwitchChatThread(threading.Thread):
                                                      # обновляет счётчик irc_cmds_seen
                                                      # (сервер отвечает 353/366) — видно,
                                                      # жив ли канал даже при тишине чата
+                            self.last_send_ok = time.time()
                         except Exception:
                             raise  # сокет уже мёртв — наверх, переподключение
+                        # считаем циклы без подтверждения со стороны сервера
+                        if now_w - last_rx_wall > 25:
+                            unconfirmed += 1
+                        else:
+                            unconfirmed = 0
                         last_keepalive = time.time()
                     continue
                 if isinstance(msg, bytes):
