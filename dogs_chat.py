@@ -60,6 +60,8 @@ DEFAULT_CONFIG = {
     "channels": ["shroud"],            # список каналов чата
     "active_window_seconds": 3600,     # "активен = писал за последний час"
     "refresh_ui_seconds": 5,           # как часто пушить обновление в UI
+    "sse_max_seconds": 90,             # раз в столько секунд SSE-поток пересоздаётся
+                                       # (страховка от «тихих» обрывов длинных соединений)
     "max_dogs": 60,                    # максимум собак на экране
     "nickname": "",                    # ник для IRC (пусто = justinfan random)
     "oauth_token": "",                 # опционально: oauth:... токен чата (для привилегированного чтения)
@@ -621,10 +623,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.close_connection = True  # keep-alive для SSE не нужен
             self.end_headers()
+            # Максимальная длительность одного SSE-соединения. После неё поток
+            # сам завершается; EventSource в браузере/OBS мгновенно открывает
+            # новое. Это «страховка от 120 секунд»: даже если где-то по пути
+            # (NAT, файрвол, кэширующий прокси, CEF) молчаливое долгое
+            # соединение тихо убьют — данные перестанут зависать, соединение
+            # регулярно пересоздаётся заново.
+            max_life = max(30, int(self.config.get("sse_max_seconds", 90)))
+            interval = max(1, int(self.config.get("refresh_ui_seconds", 5)))
+            window = self.config.get("active_window_seconds", 3600)
+            start = time.monotonic()
             try:
-                interval = max(1, int(self.config.get("refresh_ui_seconds", 5)))
-                window = self.config.get("active_window_seconds", 3600)
-                while True:
+                while time.monotonic() - start < max_life:
                     dogs = self.store.active_users()
                     data = {
                         "generated_at": int(time.time()),
@@ -637,7 +647,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     time.sleep(interval)
             except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+                pass  # клиент ушёл — штатно
             return
 
         if path == "/" or path == "/index.html":

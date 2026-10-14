@@ -619,25 +619,53 @@
   }
 
   // =========================================================================
-  // Источник данных: SSE, фолбэк — polling
+  // Источник данных: SSE + параллельный polling-страховка.
+  // Почему так: в OBS (CEF) EventSource иногда «зависает» — соединение
+  // формально открыто, но данные перестают приходить (например, после
+  // перезапуска сервиса или обрыва на несколько минут). Раньше UI молча
+  // оставался с последним снимком. Теперь, если от SSE нет сообщений дольше
+  // SSE_STALL_MS, включаем опрос /api/dogs каждые POLL_MS, пока поток не
+  // оживёт; сообщения SSE всегда приоритетны.
   // =========================================================================
-  let sseOk = false;
+  let lastMsgAt = performance.now();
+  let sseBroken = false;
+  let pollTimer = null;
+  let warnedStall = false;
   try {
     const es = new EventSource("/api/stream");
-    es.onopen = () => { sseOk = true; };
     es.onmessage = (ev) => {
-      sseOk = true;
+      lastMsgAt = performance.now();
+      sseBroken = false;
+      warnedStall = false;
+      stopPolling();
       try { render(JSON.parse(ev.data)); } catch (e) { /* ignore */ }
     };
-    es.onerror = () => { /* браузер сам переподключится */ };
-  } catch (e) { poll(); }
+    es.onerror = () => { /* браузер сам переподключится; страховка ниже */ };
+  } catch (e) { sseBroken = true; }
 
-  function poll() {
-    fetch("/api/dogs").then((r) => r.json()).then(render)
-      .catch(() => {})
-      .finally(() => setTimeout(poll, 3000));
+  function pollOnce() {
+    fetch("/api/dogs").then((r) => r.json()).then(render).catch(() => {});
   }
-  setTimeout(() => { if (!sseOk) poll(); }, 4000);
+  function startPolling() {
+    if (pollTimer) return;
+    pollOnce();
+    pollTimer = setInterval(pollOnce, POLL_MS);
+    if (!warnedStall) {
+      warnedStall = true;
+      console.warn("[dogs] SSE молчит дольше " + SSE_STALL_MS / 1000 +
+        " c — включён резервный опрос /api/dogs каждые " + POLL_MS / 1000 + " c");
+    }
+  }
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  const SSE_STALL_MS = 15000; // нет сообщений SSE 15 сек -> считаем поток мёртвым
+  const POLL_MS = 3000;       // частота страховочного опроса
+  setInterval(() => {
+    if (performance.now() - lastMsgAt > SSE_STALL_MS || sseBroken) startPolling();
+  }, 2000);
+  setTimeout(pollOnce, 1500); // первый снимок получим сразу, не дожидаясь SSE
 
   // =========================================================================
   // Тестовая панель (видна только в обычном браузере, не в OBS)
