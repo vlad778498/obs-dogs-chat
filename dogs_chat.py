@@ -380,7 +380,19 @@ class TwitchChatThread(threading.Thread):
                 if self.stop_event.wait(30.0):
                     break
                 continue
-            nick = self.config.get("nickname") or f"justinfan{int(time.time()) % 99999}"
+            # ВАЖНО: при заданном oauth_token NICK ОБЯЗАН совпадать с логином
+            # владельца токена (в нижнем регистре). Twitch проверяет пару
+            # NICK+PASS и на несоответствие отвечает
+            # "NOTICE * :Improperly formatted auth" и молча не пускает в канал.
+            token = (self.config.get("oauth_token") or "").strip()
+            cfg_nick = (self.config.get("nickname") or "").strip().lower()
+            if token and not cfg_nick:
+                log("[irc] В settings.json есть oauth_token, но пустой nickname — "
+                    "для авторизованного входа NICK должен совпадать с логином "
+                    "владельца токена. Временный fallback: анонимный justinfan*.")
+            nick = cfg_nick if (token and cfg_nick) else (cfg_nick or f"justinfan{int(time.time()) % 99999}")
+            if token:
+                log(f"[irc] Авторизованный вход: NICK={nick} + PASS oauth:***")
             try:
                 self._connect_and_read(nick, channels)
             except Exception as e:
@@ -587,6 +599,15 @@ class TwitchChatThread(threading.Thread):
                     # почему канал мог не пустить (например "No such channel")
                     if line.startswith(":") and ("NOTICE" in line or "ERR" in line.split()[1:2]):
                         log(f"[irc>] {line.strip()}")
+                        # частая причина «сервис работает, а чата нет»: неверная
+                        # авторизация. Объясняем по-человечески, что исправить.
+                        if "Improperly formatted auth" in line:
+                            log("[irc] ВНИМАНИЕ: Twitch отверг авторизацию. Проверьте в "
+                                "settings.json: 1) oauth_token — только сам токен без "
+                                "префикса 'oauth:'; 2) nickname — ЛОГИН того аккаунта, на "
+                                "который выпущен токен (регистр не важен). Если токен "
+                                "сомнительный — уберите oauth_token и nickname: сервис "
+                                "перейдёт на анонимный вход justinfan*.")
                     parsed = parse_irc_line(line)
                     if not parsed:
                         continue
