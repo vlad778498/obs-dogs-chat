@@ -26,9 +26,12 @@ OBS-плагин "Собаки чата" (Dogs of Chat)
 """
 
 import argparse
+import base64
 import json
 import os
 import socket
+import ssl
+import struct
 import sys
 import threading
 import time
@@ -67,6 +70,11 @@ DEFAULT_CONFIG = {
 # ---------------------------------------------------------------------------
 # Учёт активности чатеров
 # ---------------------------------------------------------------------------
+def log(*args):
+    """print с немедленным flush — иначе systemd/journal буферизует вывод."""
+    print(*args, file=sys.stderr, flush=True)
+
+
 class ActivityStore:
     """Потокобезопасное хранилище: user -> last_seen_ts."""
 
@@ -122,7 +130,146 @@ class ActivityStore:
 # ---------------------------------------------------------------------------
 # Клиент Twitch IRC (анонимное чтение чата)
 # ---------------------------------------------------------------------------
+
+class RawWSClient:
+    """Встроенный синхронный WebSocket-клиент (RFC6455), без зависимостей.
+    Используется, если библиотека `websockets` не установлена."""
+
+    def __init__(self, url, timeout=10.0):
+        hostport = url[len("wss://"):].split("/")[0]
+        self.host, _, port_s = hostport.partition(":")
+        self.port = int(port_s or 443)
+        self.timeout = timeout
+        self.sock = None
+        self.buf = b""
+
+    def connect(self):
+        key = base64.b64encode(os.urandom(16)).decode()
+        ctx = ssl.create_default_context()
+        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+        req = (f"GET / HTTP/1.1\r\nHost: {self.host}\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("WS handshake: соединение закрыто")
+            resp += chunk
+        head, rest = resp.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+        if "101" not in status:
+            raise ConnectionError(f"WS handshake failed: {status}")
+        self.buf = rest
+        return self
+
+    def _read_bytes(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("WS: соединение закрыто сервером")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, text):
+        payload = text.encode("utf-8")
+        header = struct.pack("!B", 0x81)  # FIN + text frame
+        mask_key = os.urandom(4)
+        ln = len(payload)
+        if ln < 126:
+            header += struct.pack("!B", 0x80 | ln)
+        elif ln < 65536:
+            header += struct.pack("!BH", 0x80 | 126, ln)
+        else:
+            header += struct.pack("!BQ", 0x80 | 127, ln)
+        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(header + mask_key + masked)
+
+    def recv(self, timeout=1.0):
+        self.sock.settimeout(timeout)
+        try:
+            first = self._read_bytes(2)
+        except socket.timeout:
+            return None
+        opcode = first[0] & 0x0F
+        ln = first[1] & 0x7F
+        if ln == 126:
+            ln = struct.unpack("!H", self._read_bytes(2))[0]
+        elif ln == 127:
+            ln = struct.unpack("!Q", self._read_bytes(8))[0]
+        data = self._read_bytes(ln) if ln else b""
+        if opcode == 0x8:
+            raise ConnectionError("WS: сервер закрыл соединение")
+        if opcode == 0x9:  # ping -> pong (маскированный, как требует RFC для клиента)
+            mk = os.urandom(4)
+            self.sock.sendall(struct.pack("!BB", 0x8A, 0x80 | len(data)) + mk
+                              + bytes(b ^ mk[i % 4] for i, b in enumerate(data)))
+            return ""
+        if opcode in (0x1, 0x2):
+            return data.decode("utf-8", "replace")
+        return ""
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
 TWITCH_WS_URL = "wss://irc-ws.chat.twitch.tv:443"
+
+
+class RawTCPClient:
+    """Минимальный sync-клиент чистого TCP IRC (тот же интерфейс, что у
+    websockets.sync: send/recv/close/context manager). Не требует зависимостей
+    и устойчив к блокировкам WebSocket-рукопожатия."""
+
+    def __init__(self, host, port, timeout=15.0):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.buf = b""
+
+    def send(self, data):
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        if not data.endswith("\r\n"):
+            data += "\r\n"
+        self.sock.sendall(data.encode("utf-8"))
+
+    def recv(self, timeout=1.0):
+        self.sock.settimeout(timeout)
+        try:
+            chunk = self.sock.recv(65536)
+        except socket.timeout:
+            return None
+        if not chunk:
+            raise ConnectionError("Twitch закрыл TCP-соединение")
+        self.buf += chunk
+        if b"\n" not in self.buf:
+            return ""  # линии пока нет — подождём следующий chunk
+        out, self.buf = self.buf.split(b"\n", 1)
+        return out.decode("utf-8", "replace").rstrip("\r")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
 
 
 def parse_tags(raw_tags: str) -> dict:
@@ -179,38 +326,72 @@ class TwitchChatThread(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        if not HAS_WEBSOCKETS:
-            print("[irc] Библиотека 'websockets' не найдена. "
-                  "Установите: pip install websockets  (или используйте --demo)")
-            return
         channels = [c.strip().lstrip("#").lower() for c in self.config.get("channels", []) if c.strip()]
         if not channels:
-            print("[irc] Каналы не заданы — IRC-поток завершён.")
+            log("[irc] Каналы не заданы — IRC-поток завершён.")
             return
-        nick = self.config.get("nickname") or f"justinfan{int(time.time()) % 99999}"
+        if not HAS_WEBSOCKETS:
+            log("[irc] Библиотека 'websockets' не найдена в окружении сервиса. "
+                "Установите в venv: /opt/dogs-chat/venv/bin/pip install websockets "
+                "(или запускайте с --demo). Повторная проверка через 30 c...")
+        # Вечный цикл: подключение -> чтение -> при любой ошибке переподключение
+        while not self.stop_event.is_set():
+            if not HAS_WEBSOCKETS:
+                if self.stop_event.wait(30.0):
+                    break
+                continue
+            nick = self.config.get("nickname") or f"justinfan{int(time.time()) % 99999}"
+            try:
+                self._connect_and_read(nick, channels)
+            except Exception as e:
+                log(f"[irc] Ошибка соединения ({type(e).__name__}: {e}). Переподключение через 5 c...")
+            if self.stop_event.wait(5.0):
+                break
+
+    def _open_conn(self):
+        """Открыть соединение. Надёжный порядок: TCP-IRC (6667) без зависимостей,
+        затем WebSocket (sync/async). Первый успешный вариант используется до обрыва."""
+        errors = []
+        # Вариант 1: чистый TCP IRC на порт 6667 — не требует websockets и
+        # устойчив к тому, что Twitch режет WS-трафик по HTTP-признакам.
         try:
-            self._connect_and_read(nick, channels)
+            return RawTCPClient("irc.chat.twitch.tv", 6667)
         except Exception as e:
-            print(f"[irc] Ошибка соединения: {e}")
+            errors.append(f"tcp6667: {type(e).__name__}: {e}")
+        # Вариант 2: WebSocket через установленную библиотеку websockets
+        if HAS_WEBSOCKETS:
+            try:
+                import websockets.sync.client as sc
+                return sc.connect(TWITCH_WS_URL, open_timeout=15)
+            except ImportError:
+                try:
+                    return self._async_connect_fallback()
+                except Exception as e:
+                    errors.append(f"ws-async: {type(e).__name__}: {e}")
+            except Exception as e:
+                errors.append(f"ws-sync: {type(e).__name__}: {e}")
+        else:
+            errors.append("websockets: библиотека не установлена")
+        raise ConnectionError("Не удалось подключиться ни одним способом -> " + " | ".join(errors))
 
     def _connect_and_read(self, nick: str, channels: list):
-        # Синхронный API websockets>=12; для старых версий — fallback через asyncio
-        conn = None
-        try:
-            conn = ws_client.connect(TWITCH_WS_URL)
-        except AttributeError:
-            conn = self._async_connect_fallback()
-        if conn is None:
-            print("[irc] Не удалось подключиться к Twitch IRC.")
-            return
+        conn = self._open_conn()
+        is_tcp = isinstance(conn, RawTCPClient)
         with conn:
             def send(s):
                 conn.send(s.encode() if isinstance(s, str) else s)
+            # Порядок критичен: NICK -> PASS -> CAP REQ. Без PASS (даже пустого
+            # для justinfan-бота) Twitch закрывает соединение до JOIN.
             send(f"NICK {nick}")
+            token = self.config.get("oauth_token", "")
+            if token and not token.startswith("oauth:"):
+                token = "oauth:" + token
+            send(f"PASS {token}" if token else "PASS ")
             send("CAP REQ :twitch.tv/tags twitch.tv/commands")
             for ch in channels:
                 send(f"JOIN #{ch}")
-            print(f"[irc] Подключено. Каналы: {', '.join(channels)}")
+            log(f"[irc] Подключено ({'TCP 6667' if is_tcp else 'WebSocket'}). Каналы: {', '.join(channels)}")
+            got_msgs = 0
             last_join_check = time.time()
             while not self.stop_event.is_set():
                 try:
@@ -218,7 +399,10 @@ class TwitchChatThread(threading.Thread):
                 except TimeoutError:
                     msg = None
                 except Exception as e:
-                    print(f"[irc] Соединение потеряно: {e}. Переподключение...")
+                    if type(e).__name__ in ("ConnectionClosed", "ConnectionClosedError"):
+                        log("[irc] Twitch закрыл соединение (см. NOTICE выше). Переподключение через 5 c...")
+                        break
+                    log(f"[irc] Соединение потеряно: {type(e).__name__}: {e}. Переподключение...")
                     break
                 if msg is None:
                     if time.time() - last_join_check > 300:
@@ -228,10 +412,18 @@ class TwitchChatThread(threading.Thread):
                     continue
                 if isinstance(msg, bytes):
                     msg = msg.decode("utf-8", "replace")
+                # PING от сервера может прийти в любом сообщении — отвечаем сразу,
+                # иначе Twitch закрывает молчаливое соединение (~через минуту)
+                if msg.startswith("PING"):
+                    send("PONG :tmi.twitch.tv")
                 for line in msg.split("\r\n"):
                     if line.startswith("PING"):
                         send("PONG :tmi.twitch.tv")
                         continue
+                    # служебные сообщения пишем в лог — по ним видно,
+                    # почему канал мог не пустить (например "No such channel")
+                    if line.startswith(":") and ("NOTICE" in line or "ERR" in line.split()[1:2]):
+                        log(f"[irc>] {line.strip()}")
                     parsed = parse_irc_line(line)
                     if not parsed:
                         continue
@@ -243,9 +435,10 @@ class TwitchChatThread(threading.Thread):
                             continue
                         badges = tags.get("badges", "")
                         is_mod = "moderator/1" in badges or "broadcaster/1" in badges
+                        got_msgs += 1
                         self.store.touch(login, tags.get("display-name", nick_user),
                                          tags.get("color", ""), is_mod=is_mod)
-            print("[irc] Поток чата остановлен.")
+            log(f"[irc] Поток чата остановлен. Принято сообщений: {got_msgs}.")
 
     def _async_connect_fallback(self):
         """Для старых версий websockets (только async API) — тонкая обёртка."""
@@ -292,7 +485,7 @@ class DemoChatThread(threading.Thread):
 
     def run(self):
         import random
-        print("[demo] Эмуляция чата запущена (--demo).")
+        log("[demo] Эмуляция чата запущена (--demo).")
         # сначала "населить" историю разными давностями
         for n in DEMO_NAMES:
             offset = random.randint(0, 7200)  # 0..2 часа назад
@@ -468,11 +661,11 @@ def load_config() -> dict:
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception as e:
-            print(f"[config] Не удалось прочитать {CONFIG_PATH}: {e}")
+            log(f"[config] Не удалось прочитать {CONFIG_PATH}: {e}")
     else:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[config] Создан файл настроек: {CONFIG_PATH}")
+        log(f"[config] Создан файл настроек: {CONFIG_PATH}")
     return cfg
 
 
@@ -492,30 +685,39 @@ def main():
 
     store = ActivityStore(config)
 
-    if args.demo or not HAS_WEBSOCKETS:
+    if args.demo:
         demo = DemoChatThread(store)
         demo.start()
-    if not args.demo and HAS_WEBSOCKETS:
+    else:
+        # В боевом режиме поднимаем ОБА источника сообщений:
+        # 1) IRC-поток (TCP 6667 / WebSocket) — основной;
+        # 2) демо-эмулятор, если библиотека websockets не установлена в venv
+        #    сервиса, чтобы в OBS что-то было даже при проблемах с зависимостью.
         irc = TwitchChatThread(store, config)
         irc.start()
+        if not HAS_WEBSOCKETS:
+            log("[main] websockets не найден — дополнительно запускаю демо-поток, "
+                "чтобы экран не был пустым. Установите: venv/bin/pip install websockets")
+            demo = DemoChatThread(store)
+            demo.start()
 
     Handler.store = store
     Handler.config = config
 
     server = QuietHTTPServer((host, port), Handler)
-    print("=" * 60)
+    log("=" * 60)
     shown_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host
-    print(f"  Собаки чата запущены:  http://{shown_host}:{port}")
+    log(f"  Собаки чата запущены:  http://{shown_host}:{port}")
     if host == "0.0.0.0":
-        print(f"  Доступ из других машин:  http://IP_этой_машины:{port}")
-    print(f"  В OBS: Источник -> Браузер -> URL http://{shown_host}:{port}")
-    print(f"  Активность: сообщение за последние {config['active_window_seconds']} сек")
-    print("  Ctrl+C — остановить.")
-    print("=" * 60)
+        log(f"  Доступ из других машин:  http://IP_этой_машины:{port}")
+    log(f"  В OBS: Источник -> Браузер -> URL http://{shown_host}:{port}")
+    log(f"  Активность: сообщение за последние {config['active_window_seconds']} сек")
+    log("  Ctrl+C — остановить.")
+    log("=" * 60)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nОстановка...")
+        print("\nОстановка...", flush=True)
         server.shutdown()
 
 
