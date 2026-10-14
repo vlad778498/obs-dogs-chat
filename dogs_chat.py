@@ -241,13 +241,24 @@ class RawTCPClient:
     def __init__(self, host, port, timeout=15.0):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.buf = b""
+        # Таймаут записи: sendall не должен зависать навечно, если TCP-путь
+        # встали (half-open / перегруженный буфер). 10 c достаточно для IRC.
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        except OSError:
+            pass
 
     def send(self, data):
         if isinstance(data, bytes):
             data = data.decode("utf-8")
         if not data.endswith("\r\n"):
             data += "\r\n"
-        self.sock.sendall(data.encode("utf-8"))
+        old = self.sock.gettimeout()
+        self.sock.settimeout(10.0)
+        try:
+            self.sock.sendall(data.encode("utf-8"))
+        finally:
+            self.sock.settimeout(old)
 
     def _extract_lines(self):
         """Забрать из буфера ВСЕ полные строки (каждая завершена \\n).
@@ -263,28 +274,30 @@ class RawTCPClient:
         return [l.decode("utf-8", "replace") for l in lines if l.strip()]
 
     def recv(self, timeout=1.0):
-        """Прочитать данные сокета; вернуть ВСЕ накопленные полные строки
-        одним сообщением (\\r\\n между ними), либо None если за timeout не
-        пришло НИ ОДНОГО байта.
+        """Вернуть ВСЕ полные IRC-строки, доступные прямо сейчас.
 
-        КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ («сообщения видны только ~60-120 c, потом
-        перестают появляться, хотя в чате пишут»): раньше один вызов recv()
-        делал РОВНО ОДИН sock.recv(). При оживлённом канале Twitch отдаёт
-        трафик пачками по несколько строк; неполная «хвостовая» строка
-        оставалась в self.buf, а recv() возвращал "" (или None по таймауту).
-        Внешний цикл считал это «секундой без входящих байтов» и watchdog
-        принудительно рвал ЖИВОЕ соединение каждые ~120 c (см. логи:
-        «Watchdog: ... нет НИ ОДНОГО ответа сервера» при «любой входящий
-        пакет был: 17 c назад»). Теперь внутри одного вызова recv() мы
-        крутимся до таймаута и ЗАБИРАЕМ ВЕСЬ доступный трафик — буфер больше
-        не оставляет «висящие» байты, и watchdog видит честную картину:
-        None == сокет действительно молчал всю секунду.
+        КЛЮЧЕВОЕ ПОВЕДЕНИЕ (исправление бага «сообщения приходят только ~60 c,
+        потом молчание до переподключения»): если в буфере УЖЕ есть полные
+        строки — они возвращаются НЕМЕДЛЕННО, без ожидания таймаута. Раньше
+        recv() всегда ждал полный `timeout`, даже когда данные готовы; из-за
+        этого обработка пачек растягивалась, и при плотном потоке сообщений
+        очередь постоянно отставала.
 
-        Также: socket.timeout (Python <3.10) и TimeoutError (>=3.10) —
-        штатная ситуация тишины, а НЕ ошибка сокета; TimeoutError является
-        подклассом OSError, поэтому порядок except здесь принципиален.
+        Если полных строк нет — читаем сокет до `timeout`:
+          * пришли байты, но линии ещё неполные -> вернём "" (сигнал
+            «байты шли, соединение живое», watchdog сбрасывается);
+          * ни одного байта за timeout -> вернём None (тишина).
+
+        socket.timeout (Python <3.10) и TimeoutError (>=3.10) — штатная
+        ситуация тишины, а НЕ ошибка сокета; TimeoutError является подклассом
+        OSError, поэтому порядок except здесь принципиален.
         """
-        deadline = time.monotonic() + timeout
+        # 1) Готовые строки есть — отдаём сразу, не спим.
+        lines = self._extract_lines()
+        if lines:
+            return "\r\n".join(lines)
+        # 2) Читаем до дедлайна, собирая весь доступный трафик.
+        deadline = time.monotonic() + max(0.0, timeout)
         got_any = False
         while True:
             remaining = deadline - time.monotonic()
@@ -305,6 +318,10 @@ class RawTCPClient:
                 raise ConnectionError("Twitch закрыл TCP-соединение")
             got_any = True
             self.buf += chunk
+            # Как только набрали полную строку — выходим и отдаём её сразу,
+            # остаток дочитается следующим вызовом (без задержки).
+            if b"\n" in self.buf:
+                break
         lines = self._extract_lines()
         if lines:
             return "\r\n".join(lines)
@@ -402,6 +419,7 @@ class TwitchChatThread(threading.Thread):
         self.my_pongs = 0              # сколько раз мы ответили PONG на PING сервера
         self.server_pings = 0          # сколько PING прислал сервер
         self.last_privmsg_line = ""    # последняя полная строка PRIVMSG (для лога)
+        self._rx_buf = 0               # байт в буфере conn (неполные строки), для [diag]
         self.irc_cmds_seen = {}        # счётчик всех IRC-команд от сервера за соединение
                                        # (JOIN/PART/NAMES/353/NOTICE/PRIVMSG...) — по нему
                                        # видно, жив ли канал и что именно шлёт Twitch
@@ -535,7 +553,8 @@ class TwitchChatThread(threading.Thread):
             f"наших PONG: {self.my_pongs}. "
             + ("ВЫВОД: Twitch НЕ присылает нам трафик (см. [msg]/[diag]) — причина вне нашего кода."
                if self.rx_last_ts is None or now - self.rx_last_ts > 60
-               else "ВЫВОД: пакеты от Twitch приходят — если чатеров нет, значит в чате тихо или теряются PRIVMSG."))
+               else "ВЫВОД: пакеты от Twitch приходят — если чатеров нет, значит в чате тихо или теряются PRIVMSG.")
+            + f" Буфер сокета: {self._rx_buf} байт непереведённых строк; всего переподключений: {self.conn_id}.")
         # какие команды вообще приходили от сервера за это соединение. Если тут
         # есть JOIN/PART/NAMES/353, но нет PRIVMSG — канал жив и Twitch реально
         # не шлёт сообщения чата (типично для анонимного justinfan-подключения).
@@ -602,7 +621,11 @@ class TwitchChatThread(threading.Thread):
             watchdog_s_static = max(40, int(self.config.get(
                 "irc_watchdog_seconds", WATCHDOG_S_DEFAULT)))
             while not self.stop_event.is_set():
-                self._log_alive()          # раз в 2 минуты строчка [alive] в journal
+                # ВАЖНО: _log_alive() вызывается ТОЛЬКО когда тик реально
+                # что-то прочитал или сокет молчал полную секунду (см. ниже).
+                # Если conn.recv() вернул "" (байты пришли, но полных строк
+                # пока нет), цикл продолжался БЕЗ sleep и крутился на 100% CPU,
+                # успевая затащить в лог тысячи строк [alive]/[diag] за минуту.
                 try:
                     msg = conn.recv(timeout=1.0)
                 except (TimeoutError, socket.timeout):
@@ -616,6 +639,7 @@ class TwitchChatThread(threading.Thread):
                     log(f"[irc] Соединение потеряно: {type(e).__name__}: {e}. Переподключение...")
                     break
                 if msg is None:
+                    self._log_alive()      # раз в 2 минуты строчка [alive] в journal
                     now_w = time.time()
                     # recv вернул None => за ПОЛНУЮ секунду из сокета не пришло
                     # НИ ОДНОГО байта (новый recv() вычитывает весь доступный
@@ -667,6 +691,13 @@ class TwitchChatThread(threading.Thread):
                 last_rx_wall = time.time()
                 silent_ticks = 0   # байты из сокета идут — соединение живое
                 idle_logged_60 = False
+                # размер буфера соединения (для [diag]; websockets его не имеет)
+                self._rx_buf = len(getattr(conn, "buf", b""))
+                if not msg:
+                    # байты пришли, но полных строк ещё нет — идём читать дальше
+                    # БЕЗ _log_alive (см. защиту от busy-loop выше)
+                    continue
+                self._log_alive()  # раз в 2 минуты строчка [alive] в journal
                 # PING от сервера может прийти в любом сообщении — отвечаем сразу,
                 # иначе Twitch закрывает молчаливое соединение (~через минуту)
                 if "PING" in msg:
@@ -1029,10 +1060,9 @@ def main():
         irc = TwitchChatThread(store, config)
         irc.start()
         if not HAS_WEBSOCKETS:
-            log("[main] websockets не найден — дополнительно запускаю демо-поток, "
-                "чтобы экран не был пустым. Установите: venv/bin/pip install websockets")
-            demo = DemoChatThread(store)
-            demo.start()
+            log("[main] Библиотека 'websockets' не найдена — это НЕ ошибка: "
+                "IRC работает по чистому TCP 6667 без зависимостей. "
+                "(WebSocket-транспорт будет включён, если поставить websockets.)")
 
     Handler.store = store
     Handler.config = config
