@@ -96,18 +96,30 @@
       return null;
     },
 
+    // Есть ли у позы собственные кадры (у породы или хотя бы у базовой
+    // собаки dog-*). Используется, чтобы при ходьбе НЕ подставлять idle:
+    // если walk-кадров нет — собака идёт своим idle-циклом, а не «телепает»
+    // между двумя позами.
+    hasPoseFrames(breed, pose, dir) {
+      return this.framesFor(breed, pose, dir, true).length > 0;
+    },
+
     // Кадры анимации для breed+pose+dir (N = 0..8). Если у породы своих
     // кадров нет — фолбэк к базовой собаке dog-* ("generic"), чтобы
     // нарисованная базовая анимация работала для всех пород без PNG.
-    framesFor(breed, pose, dir) {
-      const key = breed + "|" + pose + "|" + dir;
+    // strict=true: только кадры самой позы, БЕЗ подстановки idle-фолбэка
+    // (нужно движку, чтобы отличать «есть walk» от «walk нет, идём в idle»).
+    framesFor(breed, pose, dir, strict) {
+      const key = breed + "|" + pose + "|" + dir + (strict ? "|s" : "");
       if (this._frameCache.has(key)) return this._frameCache.get(key);
       const b = String(breed).toLowerCase(), d = String(dir).toLowerCase();
       let urls = this._poseFrames(b, pose, d, 0);
-      if (!urls.length && pose !== "idle") urls = this._poseFrames(b, "idle", d, 0);
+      if (!strict) {
+        if (!urls.length && pose !== "idle") urls = this._poseFrames(b, "idle", d, 0);
+      }
       if (!urls.length && b !== "dog") {
         urls = this._poseFrames("dog", pose, d, 0);
-        if (!urls.length && pose !== "idle") urls = this._poseFrames("dog", "idle", d, 0);
+        if (!strict && !urls.length && pose !== "idle") urls = this._poseFrames("dog", "idle", d, 0);
       }
       this._frameCache.set(key, urls);
       return urls;
@@ -400,28 +412,23 @@
 
   // =========================================================================
   // Покадровая анимация: глобальный счётчик кадров, все собаки синхронно.
-  // Для позы с нарисованными кадрами (0..N) проигрывается вся цепочка;
-  // для старой двухкадровой схемы — idle/walk чередуются как раньше.
+  // Для позы с нарисованными кадрами (0..N) проигрывается вся цепочка этой
+  // позы. При ходьбе используются ТОЛЬКО walk-кадры — idle в цикл шага не
+  // подмешивается. Старая двухкадровая схема (walk/idle без номеров) тоже
+  // листается как цикл из двух кадров той же позы.
   // =========================================================================
-  let frameToggle = false;   // compat: старая схема из двух безымянных файлов
   let globalFrame = 0;       // номер текущего кадра многокадровой анимации
   function startFrameTimer() {
     // пересоздаём интервал при перезагрузке ассетов (мог измениться frame-duration.txt)
     if (startFrameTimer._t) clearInterval(startFrameTimer._t);
     startFrameTimer._t = setInterval(() => {
-      frameToggle = !frameToggle;
       globalFrame++;
       for (const [, d] of dogs) { if (!d.leaving) updateDogFrame(d); }
       for (const [, el] of mods) {
         const st = el._st || {};
-        const hasModWalk = [...Assets.files].some((f) => /^mod-walk(-\d)?-(left|right)\.png$/.test(f));
-        const pose = frameToggle && hasModWalk ? "walk" : "idle";
-        if (st.pose !== pose) {
-          st.pose = pose; el._st = st;
-          applySprite(el.querySelector(".sprite"), el, st.breed || "shepherd", pose, "right", st.tint);
-        } else {
-          advanceFrames(el.querySelector(".sprite"));
-        }
+        // модератор на будке всегда в idle-цикле (если есть mod-idle-кадры),
+        // walk ему не подмешиваем
+        advanceFrames(el.querySelector(".sprite"));
       }
     }, Math.max(60, Assets.frameMs || 250));
   }
@@ -440,13 +447,16 @@
 
   function updateDogFrame(d) {
     const moving = Math.abs(d.target - d.x) > 2;
-    const hasWalk = [...Assets.files].some((f) => /-walk(-\d)?-(left|right)\.png$/.test(f));
+    const breed = d.st && d.st.breed ? d.st.breed : "mutt";
+    const dirNow = d.faceLeft ? "left" : "right";
+    // есть ли собственные walk-кадры у этой породы или хотя бы у базовой dog-*
+    const hasWalk = Assets.hasPoseFrames(breed, "walk", dirNow);
     let pose;
     if (!moving) pose = "idle";
-    else if (!hasWalk) pose = "idle";                  // walk-кадров нет — без дёрганья
-    else if (d.running && Assets.runArt) pose = "run";
-    else pose = frameToggle ? "walk" : "idle";         // compat: пара безымянных файлов
-    const dir = d.faceLeft ? "left" : "right";
+    else if (!hasWalk) pose = "idle";                  // walk-кадров нет — идём своим idle-циклом
+    else if (d.running && Assets.runArt && Assets.hasPoseFrames(breed, "run", dirNow)) pose = "run";
+    else pose = "walk";                                // при ходьбе ТОЛЬКО walk-кадры, без idle
+    const dir = dirNow;
     const st = d.st || (d.st = {});
     const key = st.breed + "|" + pose + "|" + dir;
     if (st.pose === pose && st.dir === dir && d.spriteEl.dataset.sprite === key) {
