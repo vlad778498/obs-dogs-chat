@@ -495,8 +495,14 @@ class TwitchChatThread(threading.Thread):
             # justinfan* работает только вообще без PASS. PASS шлём ТОЛЬКО если
             # в settings.json задан oauth_token.
             send(f"NICK {nick}")
-            token = self.config.get("oauth_token", "")
-            if token and not token.startswith("oauth:"):
+            token = (self.config.get("oauth_token") or "").strip()
+            # Допускаем в settings.json любой из форматов, которые люди
+            # копируют из генераторов токенов: "abc123...", "oauth:abc123..."
+            # или "password=oauth:abc123..." (формат чужих сниппетов) —
+            # приводим к каноническому PASS oauth:<токен>.
+            if token.lower().startswith("password="):
+                token = token.split("=", 1)[1].strip()
+            if token and not token.lower().startswith("oauth:"):
                 token = "oauth:" + token
             if token:
                 send(f"PASS {token}")
