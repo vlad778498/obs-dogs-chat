@@ -256,11 +256,35 @@ class RawTCPClient:
         в буфере, пока мы его не дочитаем, — Twitch закрывал соединение за
         молчание (ConnectionReset сразу после подключения при оживлённом канале).
         Теперь читаем всё доступное и отдаём целиком, чтобы PING обрабатывался
-        немедленно."""
+        немедленно.
+
+        ВАЖНО (исправление «сообщения пропадают примерно через 120 c»): на
+        Windows Python < 3.10 бросает при таймауте socket.timeout, а начиная
+        с 3.10 — TimeoutError (это разные классы!). Здесь перехватываются ОБА,
+        иначе сокет остаётся с выставленным settimeout(1.0) и любой последующий
+        send() (PING/JOIN в keep-alive ветке) через ~120 c молчания чата
+        падает с BlockingIOError/WOULDBLOCK -> соединение рвалось и
+        переподключалось само собой.
+        """
         self.sock.settimeout(timeout)
+        timed_out = False
         try:
             chunk = self.sock.recv(65536)
-        except socket.timeout:
+        except (socket.timeout, TimeoutError):
+            # Таймаут чтения — ШТАТНАЯ ситуация (в чате тихо), НЕ ошибка
+            # сокета. ВАЖНО: TimeoutError является подклассом OSError,
+            # поэтому этот except ОБЯЗАН стоять перед обработкой OSError —
+            # иначе живой коннект рвался при первой же секунде тишины чата
+            # («сообщения перестают появляться примерно через 120 c»).
+            chunk = b""
+            timed_out = True
+        except OSError:
+            raise  # настоящая ошибка сокета — наверх (переподключение)
+        finally:
+            # вернуть неблокирующему сокету бесконечный таймаут:
+            # send() обязан блокироваться до отправки, а не падать по таймауту
+            self.sock.settimeout(None)
+        if timed_out:
             # таймаут истёк, но в буфере могли остаться полные линии — отдадим их
             if b"\n" in self.buf:
                 out, self.buf = self.buf, b""
@@ -396,7 +420,14 @@ class TwitchChatThread(threading.Thread):
                 "(или запускайте с --demo). Повторная проверка через 30 c...")
         # Вечный цикл: подключение -> чтение -> при любой ошибке переподключение
         while not self.stop_event.is_set():
-            if not HAS_WEBSOCKETS:
+            # ВАЖНО: чистый TCP-IRC (RawTCPClient) НЕ требует библиотеки
+            # websockets. Раньше при её отсутствии поток вообще не подключался
+            # («websockets не найдена… повторная проверка через 30 c») и
+            # сообщения не появлялись, хотя TCP 6667 работал бы без неё.
+            # Теперь пропускаем цикл, только если вебсокеты нужны ЯВНО
+            # (irc_transport = "ws") — тогда TCP недоступен по настройке.
+            order0 = (self.config.get("irc_transport") or "").strip().lower()
+            if not HAS_WEBSOCKETS and order0 == "ws":
                 if self.stop_event.wait(30.0):
                     break
                 continue
@@ -565,7 +596,11 @@ class TwitchChatThread(threading.Thread):
                 self._log_alive()          # раз в 2 минуты строчка [alive] в journal
                 try:
                     msg = conn.recv(timeout=1.0)
-                except TimeoutError:
+                except (TimeoutError, socket.timeout):
+                    # socket.timeout и TimeoutError — РАЗНЫЕ классы в разных
+                    # версиях Python (до 3.10 / с 3.10). Перехватываем оба,
+                    # иначе «таймаут» улетал в ветку ниже как ошибка соединения
+                    # и рвал живой коннект при первой же секунде тишины чата.
                     msg = None
                 except Exception as e:
                     if type(e).__name__ in ("ConnectionClosed", "ConnectionClosedError"):
@@ -600,15 +635,22 @@ class TwitchChatThread(threading.Thread):
                         # путь; send() в такой сокет «успешен», поэтому рвём
                         # сами). Обычная тишина в чате watchdog не трогает.
                         since_rx2 = now_w - last_rx_wall
-                        # Если Twitch отвечает на наши PING (:dogs-chat) — путь
-                        # точно живой, даже когда в чате молчат минутами. Такое
-                        # соединение НЕ рвём никогда; разрыв только при реальном
-                        # отсутствии любых ответов сервера.
+                        # Живость соединения подтверждаем ЛЮБЫМИ входящими
+                        # пакетами, а не только PONG на наш PING: Twitch по IRC
+                        # регулярно шлёт серверные PING (мы отвечаем PONG), и
+                        # именно это штатный признак живого пути. Раньше
+                        # учитывался лишь PONG на НАШ PING, который TMI иногда
+                        # не шлёт вовсе — из-за этого watchdog срабатывал ровно
+                        # через WATCHDOG_S (120 c) тишины в чате, хотя
+                        # соединение было живым, и сообщения «переставали
+                        # приходить» до переподключения.
                         pong_ok = (self.last_pong_reply is not None and
                                    now_w - self.last_pong_reply < 70)
                         watchdog_s = max(40, int(self.config.get(
                             "irc_watchdog_seconds", WATCHDOG_S_DEFAULT)))
-                        if since_rx2 > watchdog_s and not pong_ok:
+                        rx_alive = (self.rx_last_ts is not None and
+                                    now_w - self.rx_last_ts < max(70, watchdog_s // 2))
+                        if since_rx2 > watchdog_s and not (pong_ok or rx_alive):
                             log(f"[irc] Watchdog: {int(since_rx2)} c нет НИ ОДНОГО "
                                 f"ответа сервера (последняя попытка PING была "
                                 f"подтверждена? {'нет' if unconfirmed else 'да'}). "
@@ -647,7 +689,24 @@ class TwitchChatThread(threading.Thread):
                 # иначе Twitch закрывает молчаливое соединение (~через минуту)
                 if "PING" in msg:
                     for line in msg.split("\r\n"):
-                        if line.startswith("PING"):
+                        # Определяем команду строго по синтаксису IRC, а не по
+                        # вхождению подстроки "PING": раньше строка вида
+                        # ":nick!u@h PRIVMSG #ch :привет, PING!" ошибочно
+                        # считалась серверным PING — мы зря шали PONG, а
+                        # реальная обработка строки пропускалась (сообщение
+                        # «терялось»). Теперь сверяем токен команды после
+                        # префикса/тегов. PING может приходить с префиксом,
+                        # например ":tmi.twitch.tv PING :irc.chat.twitch.tv" —
+                        # на такой тоже отвечаем немедленно, иначе Twitch
+                        # ровно через ~120 c молчания закрывает соединение сам
+                        # («сообщения перестают появляться, приходится
+                        # переподключаться»).
+                        try:
+                            parsed_hdr = parse_irc_line(line)
+                        except Exception:
+                            parsed_hdr = None
+                        cmd_hdr = parsed_hdr[2] if parsed_hdr else ""
+                        if cmd_hdr == "PING":
                             send("PONG :tmi.twitch.tv")
                             self.server_pings += 1
                             self.my_pongs += 1
@@ -656,11 +715,20 @@ class TwitchChatThread(threading.Thread):
                     if not line.strip():
                         continue
                     self.rx_lines += 1
-                    if line.startswith("PING"):
-                        continue  # уже обработано выше
+                    try:
+                        parsed = parse_irc_line(line)
+                    except Exception:
+                        parsed = None
+                    if not parsed:
+                        continue
+                    nick_user, tags, cmd, params, trailing = parsed
+                    if cmd == "PING":
+                        continue  # уже обработано выше (ответ PONG отправлен)
+                    # учёт ВСЕХ команд от сервера — для [cmds] в диагностике
+                    self.irc_cmds_seen[cmd] = self.irc_cmds_seen.get(cmd, 0) + 1
                     # служебные сообщения пишем в лог — по ним видно,
                     # почему канал мог не пустить (например "No such channel")
-                    if line.startswith(":") and ("NOTICE" in line or "ERR" in line.split()[1:2]):
+                    if line.startswith(":") and (cmd == "NOTICE" or (params and str(params[0]).startswith("4"))):
                         log(f"[irc>] {line.strip()}")
                         # частая причина «сервис работает, а чата нет»: неверная
                         # авторизация. Объясняем по-человечески, что исправить.
@@ -688,12 +756,6 @@ class TwitchChatThread(threading.Thread):
                                 + " Что делать: перегенерируйте токен со scope chat:read для "
                                   "аккаунта из nickname; либо удалите oauth_token/nickname — "
                                   "сервис перейдёт на анонимный вход justinfan*.")
-                    parsed = parse_irc_line(line)
-                    if not parsed:
-                        continue
-                    nick_user, tags, cmd, params, trailing = parsed
-                    # учёт ВСЕХ команд от сервера — для [cmds] в диагностике
-                    self.irc_cmds_seen[cmd] = self.irc_cmds_seen.get(cmd, 0) + 1
                     if cmd == "PONG":
                         # Twitch ответил на наш собственный PING (:dogs-chat)
                         # — значит TCP-путь туда-обратно живой даже при полной
