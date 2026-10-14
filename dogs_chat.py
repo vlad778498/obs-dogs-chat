@@ -27,6 +27,7 @@ OBS-плагин "Собаки чата" (Dogs of Chat)
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import socket
@@ -39,16 +40,14 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from pathlib import Path
 
+# Библиотека `websockets` НЕ является зависимостью: оба транспорта (WSS 443 и
+# TCP 6667) реализованы нативными клиентами в этом файле (RawWSClient/RawTCPClient).
+# Флаг оставлен только для информационного лога при старте.
 try:
-    import websockets.sync.client as ws_client  # websockets >= 12 (sync API)
+    import websockets  # noqa: F401
     HAS_WEBSOCKETS = True
 except Exception:
-    try:
-        import asyncio
-        import websockets  # noqa: F401
-        HAS_WEBSOCKETS = True  # async API, будет запускаться в отдельном потоке
-    except Exception:
-        HAS_WEBSOCKETS = False
+    HAS_WEBSOCKETS = False
 
 BASE_DIR = Path(__file__).resolve().parent
 UI_DIR = BASE_DIR / "ui"
@@ -65,7 +64,7 @@ DEFAULT_CONFIG = {
     "max_dogs": 60,                    # максимум собак на экране
     "nickname": "",                    # ник для IRC (пусто = justinfan random)
     "oauth_token": "",                 # опционально: oauth:... токен чата (для привилегированного чтения)
-    "irc_transport": "",               # ""/auto|tcp|ws — приоритет транспорта IRC (см. _open_conn)
+    "irc_transport": "",               # ""/auto = wss 443 (основной) + tcp 6667 (резерв); "tcp"/"ws" — только один из них
     "http_port": 8377,
     "http_host": "127.0.0.1",          # 0.0.0.0 — если сервер на ВМ, а OBS на другой машине
 }
@@ -136,8 +135,22 @@ class ActivityStore:
 # ---------------------------------------------------------------------------
 
 class RawWSClient:
-    """Встроенный синхронный WebSocket-клиент (RFC6455), без зависимостей.
-    Используется, если библиотека `websockets` не установлена."""
+    """Встроенный синхронный WebSocket-клиент (RFC6455) поверх стандартного ssl.
+
+    Без каких-либо внешних зависимостей — работает даже там, где pip заблокирован
+    (PEP 668 / externally-managed-environment). Интерфейс совместим с
+    websockets.sync.client.connect: send(str|bytes), recv(timeout), close(),
+    контекстный менеджер. Twitch отдаёт IRC-сообщения текстовыми кадрами;
+    бинарные и фрагментированные кадры тоже поддерживаются, служебные
+    ping/pong/close обрабатываются прозрачно.
+
+    Это ОСНОВНОЙ транспорт: проверено живым тестом (tests/twitch_connect_test.py
+    --wss --duration 300) — соединение на порту 443 держится стабильно весь
+    прогон, тогда как plain-TCP 6667 на этой сети регулярно умирал (~2 мин).
+    """
+
+    OP_CONT, OP_TEXT, OP_BIN = 0x0, 0x1, 0x2
+    OP_CLOSE, OP_PING, OP_PONG = 0x8, 0x9, 0xA
 
     def __init__(self, url, timeout=10.0):
         hostport = url[len("wss://"):].split("/")[0]
@@ -145,14 +158,17 @@ class RawWSClient:
         self.port = int(port_s or 443)
         self.timeout = timeout
         self.sock = None
-        self.buf = b""
+        self.buf = b""          # сырые байты из сокета (кадры + заголовок)
+        self._rxacc = b""       # накопитель IRC-строк из декодированных кадров
+        self._frag = b""        # собранный незавершённый фрагментированный кадр
+        self._frag_op = None
 
     def connect(self):
         key = base64.b64encode(os.urandom(16)).decode()
         ctx = ssl.create_default_context()
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
         self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
-        req = (f"GET / HTTP/1.1\r\nHost: {self.host}\r\n"
+        req = (f"GET / HTTP/1.1\r\nHost: {self.host}\r\nOrigin: https://twitch.tv\r\n"
                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
         self.sock.sendall(req.encode())
@@ -166,62 +182,163 @@ class RawWSClient:
         status = head.split(b"\r\n", 1)[0].decode(errors="replace")
         if "101" not in status:
             raise ConnectionError(f"WS handshake failed: {status}")
+        expect = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        if expect.lower().encode() not in head.lower():
+            raise ConnectionError(f"WS handshake: неверный Sec-WebSocket-Accept в {status!r}")
         self.buf = rest
+        self.sock.settimeout(None)   # неблокирующий режим управляется в recv()
         return self
 
-    def _read_bytes(self, n):
+    # ---------- низкоуровневые операции с кадрами ----------
+    def _read_exact(self, n, deadline):
+        """Вернуть ровно n байт потока или бросить socket.timeout к дедлайну."""
         while len(self.buf) < n:
-            chunk = self.sock.recv(65536)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout()
+            self.sock.settimeout(min(remaining, 1.0))
+            try:
+                chunk = self.sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                # штатная тишина: проверим дедлайн и попробуем ещё раз
+                if deadline - time.monotonic() <= 0:
+                    raise
+                continue
+            finally:
+                self.sock.settimeout(None)
             if not chunk:
-                raise ConnectionError("WS: соединение закрыто сервером")
+                raise ConnectionError("WS: сервер закрыл соединение (0 байт)")
             self.buf += chunk
         out, self.buf = self.buf[:n], self.buf[n:]
         return out
 
-    def send(self, text):
-        payload = text.encode("utf-8")
-        header = struct.pack("!B", 0x81)  # FIN + text frame
+    def _send_frame(self, opcode, payload=b""):
         mask_key = os.urandom(4)
         ln = len(payload)
         if ln < 126:
-            header += struct.pack("!B", 0x80 | ln)
+            header = struct.pack("!BB", 0x80 | opcode, 0x80 | ln)
         elif ln < 65536:
-            header += struct.pack("!BH", 0x80 | 126, ln)
+            header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, ln)
         else:
-            header += struct.pack("!BQ", 0x80 | 127, ln)
+            header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, ln)
         masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        self.sock.sendall(header + mask_key + masked)
+        old = self.sock.gettimeout()
+        self.sock.settimeout(10.0)   # sendall не должен зависать навечно
+        try:
+            self.sock.sendall(header + mask_key + masked)
+        finally:
+            self.sock.settimeout(old)
+
+    def _next_message(self, deadline):
+        """Следующий ПРИКЛАДНЫЙ кадр (text/bin, bytes). Служебные кадры
+        (ping->pong, pong, cont-фрагменты) обрабатывает сама; close — исключение."""
+        while True:
+            b0, b1 = self._read_exact(2, deadline)
+            fin = b0 & 0x80
+            op = b0 & 0x0F
+            if b1 & 0x80:
+                raise ConnectionError("WS: клиент не ожидает замаскированных кадров от сервера")
+            ln = b1 & 0x7F
+            if ln == 126:
+                ln = struct.unpack("!H", self._read_exact(2, deadline))[0]
+            elif ln == 127:
+                ln = struct.unpack("!Q", self._read_exact(8, deadline))[0]
+            payload = self._read_exact(ln, deadline) if ln else b""
+            if op == self.OP_PING:
+                self._send_frame(self.OP_PONG, payload)
+                continue
+            if op == self.OP_PONG:
+                continue
+            if op == self.OP_CLOSE:
+                raise ConnectionError("WS: сервер закрыл соединение (CLOSE)")
+            if op in (self.OP_TEXT, self.OP_BIN):
+                if fin:
+                    return payload
+                self._frag, self._frag_op = payload, op
+                continue
+            if op == self.OP_CONT:
+                self._frag += payload
+                if fin:
+                    out, self._frag = self._frag, b""
+                    return out
+                continue
+            raise ConnectionError(f"WS: неизвестный opcode {op:#x}")
+
+    # ---------- публичный интерфейс (как у websockets.sync) ----------
+    def send(self, data):
+        if isinstance(data, bytes):
+            opcode, payload = self.OP_BIN, data
+        else:
+            opcode, payload = self.OP_TEXT, data.encode("utf-8", "replace")
+        self._send_frame(opcode, payload)
 
     def recv(self, timeout=1.0):
-        self.sock.settimeout(timeout)
-        try:
-            first = self._read_bytes(2)
-        except socket.timeout:
-            return None
-        opcode = first[0] & 0x0F
-        ln = first[1] & 0x7F
-        if ln == 126:
-            ln = struct.unpack("!H", self._read_bytes(2))[0]
-        elif ln == 127:
-            ln = struct.unpack("!Q", self._read_bytes(8))[0]
-        data = self._read_bytes(ln) if ln else b""
-        if opcode == 0x8:
-            raise ConnectionError("WS: сервер закрыл соединение")
-        if opcode == 0x9:  # ping -> pong (маскированный, как требует RFC для клиента)
-            mk = os.urandom(4)
-            self.sock.sendall(struct.pack("!BB", 0x8A, 0x80 | len(data)) + mk
-                              + bytes(b ^ mk[i % 4] for i, b in enumerate(data)))
-            return ""
-        if opcode in (0x1, 0x2):
-            return data.decode("utf-8", "replace")
-        return ""
+        """Вернуть ВСЕ доступные строки IRC до истечения timeout (секунд).
+
+        Ключевое поведение (см. историю бага «сообщения видны только ~60 c»):
+          * полные строки уже есть в буфере -> возвращаем НЕМЕДЛЕННО, без сна;
+          * байты пришли, но строк пока нет -> вернём "" (сигнал «соединение
+            живое», watchdog сбрасывается);
+          * ни одного байта за timeout -> вернём None (тишина канала).
+        Строки склеиваются через \\r\\n — внешний цикл сам делает split.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        lines = []
+        got_any = False
+        while True:
+            # 1) сначала отдаём всё, что уже насобиралось (без ожидания)
+            if self._msgbuf_has_lines():
+                lines.extend(self._extract_msg_lines())
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                msg = self._next_message(deadline)
+            except (socket.timeout, TimeoutError):
+                break  # штатная тишина
+            except OSError:
+                raise  # настоящая ошибка сокета — наверх (переподключение)
+            got_any = True
+            self._rxacc += msg
+            # Twitch шлёт несколько IRC-строк в одном WS-кадре (\r\n между ними);
+            # как только появилась полная строка — выходим и отдаём её сразу,
+            # остаток дочитается следующим вызовом recv() без задержки.
+            if b"\n" in self._rxacc:
+                continue
+        joined = "\r\n".join(lines)
+        if joined:
+            return joined
+        return None if not got_any else ""
+
+    def _msgbuf_has_lines(self):
+        return b"\n" in getattr(self, "_rxacc", b"")
+
+    def _extract_msg_lines(self):
+        if b"\n" not in self._rxacc:
+            return []
+        parts = self._rxacc.split(b"\n")
+        self._rxacc = parts.pop()  # хвост без \n — ждём продолжения
+        out = []
+        for p in parts:
+            p = p.rstrip(b"\r")
+            if p.strip():
+                out.append(p.decode("utf-8", "replace"))
+        return out
 
     def close(self):
+        try:
+            if self.sock:
+                self._send_frame(self.OP_CLOSE)
+        except Exception:
+            pass
         try:
             if self.sock:
                 self.sock.close()
         except Exception:
             pass
+        self.sock = None
 
     def __enter__(self):
         return self
@@ -230,7 +347,11 @@ class RawWSClient:
         self.close()
 
 
-TWITCH_WS_URL = "wss://irc-ws.chat.twitch.tv:443"
+TWITCH_WS_HOST = "irc-ws.chat.twitch.tv"
+TWITCH_WS_PORT = 443
+TWITCH_WS_URL = f"wss://{TWITCH_WS_HOST}:{TWITCH_WS_PORT}"
+TWITCH_TCP_HOST = "irc.chat.twitch.tv"
+TWITCH_TCP_PORT = 6667
 
 
 class RawTCPClient:
@@ -438,23 +559,10 @@ class TwitchChatThread(threading.Thread):
         if not channels:
             log("[irc] Каналы не заданы — IRC-поток завершён.")
             return
-        if not HAS_WEBSOCKETS:
-            log("[irc] Библиотека 'websockets' не найдена в окружении сервиса. "
-                "Установите в venv: /opt/dogs-chat/venv/bin/pip install websockets "
-                "(или запускайте с --demo). Повторная проверка через 30 c...")
-        # Вечный цикл: подключение -> чтение -> при любой ошибке переподключение
+        # Вечный цикл: подключение -> чтение -> при любой ошибке переподключение.
+        # Библиотека `websockets` больше НЕ нужна ни в одном режиме: и WSS 443,
+        # и TCP 6667 работают нативными клиентами (RawWSClient / RawTCPClient).
         while not self.stop_event.is_set():
-            # ВАЖНО: чистый TCP-IRC (RawTCPClient) НЕ требует библиотеки
-            # websockets. Раньше при её отсутствии поток вообще не подключался
-            # («websockets не найдена… повторная проверка через 30 c») и
-            # сообщения не появлялись, хотя TCP 6667 работал бы без неё.
-            # Теперь пропускаем цикл, только если вебсокеты нужны ЯВНО
-            # (irc_transport = "ws") — тогда TCP недоступен по настройке.
-            order0 = (self.config.get("irc_transport") or "").strip().lower()
-            if not HAS_WEBSOCKETS and order0 == "ws":
-                if self.stop_event.wait(30.0):
-                    break
-                continue
             # ВАЖНО: при заданном oauth_token NICK ОБЯЗАН совпадать с логином
             # владельца токена (в нижнем регистре). Twitch проверяет пару
             # NICK+PASS и на несоответствие отвечает
@@ -476,48 +584,40 @@ class TwitchChatThread(threading.Thread):
                 break
 
     def _open_conn(self):
-        """Открыть соединение. Надёжный порядок: TCP-IRC (6667) без зависимостей,
-        затем WebSocket (sync/async). Первый успешный вариант используется до обрыва.
+        """Открыть соединение. Порядок по умолчанию: WebSocket 443 (нативный
+        RawWSClient — без зависимостей), затем plain-TCP 6667 как резерв.
 
-        ВАЖНО: WS идёт в списке ПОСЛЕ TCP и является резервным — на некоторых
-        IP/провайдерах TMI молча закрывает WebSocket-соединение сразу после
-        рукопожатия (0 сообщений), тогда как TCP 6667 работает стабильно.
-        Порядок можно задать в settings.json: "irc_transport": "tcp"|"ws"
-        (пусто/нет ключа = автоопределение по этому списку)."""
+        ВАЖНО (по живым тестам на этой сети, tests/twitch_connect_test.py):
+        WSS на порту 443 держится стабильно часами, тогда как TCP 6667
+        регулярно умирал каждые ~2 минуты (NAT/провайдер режет long-lived
+        соединения на нестандартном порту). Поэтому WS — ОСНОВНОЙ транспорт,
+        а TCP — запасной (например, если TLS-инспекция мешает handshake).
+        Библиотека `websockets` НЕ нужна ни для чего: используется наш
+        встроенный RFC6455-клиент. Порядок можно переопределить в
+        settings.json: "irc_transport": "tcp"|"ws" (пусто = авто = ws-first)."""
         errors = []
         order = (self.config.get("irc_transport") or "").strip().lower()
+        if order not in ("", "tcp", "ws", "auto"):
+            log(f"[irc] Неизвестный irc_transport='{order}', использую авто (wss 443)")
         want_tcp = order in ("", "tcp", "auto")
         want_ws = order in ("", "ws", "auto")
-        if order not in ("", "tcp", "ws", "auto"):
-            log(f"[irc] Неизвестный irc_transport='{order}', использую авто")
 
-        # Вариант 1: чистый TCP IRC на порт 6667 — не требует websockets и
-        # устойчив к тому, что Twitch режет WS-трафик по HTTP-признакам.
+        # Вариант 1: WebSocket wss://irc-ws.chat.twitch.tv:443 — нативный клиент.
+        if want_ws:
+            try:
+                conn = RawWSClient(TWITCH_WS_URL, timeout=15.0).connect()
+                self.last_transport = "WebSocket wss://443"
+                return conn
+            except Exception as e:
+                errors.append(f"wss-native: {type(e).__name__}: {e}")
+        # Вариант 2: чистый TCP IRC на порт 6667 — резерв (без TLS/WS).
         if want_tcp:
             try:
-                conn = RawTCPClient("irc.chat.twitch.tv", 6667)
+                conn = RawTCPClient(TWITCH_TCP_HOST, TWITCH_TCP_PORT)
                 self.last_transport = "TCP 6667"
                 return conn
             except Exception as e:
                 errors.append(f"tcp6667: {type(e).__name__}: {e}")
-        # Вариант 2: WebSocket через установленную библиотеку websockets
-        if want_ws and HAS_WEBSOCKETS:
-            try:
-                import websockets.sync.client as sc
-                conn = sc.connect(TWITCH_WS_URL, open_timeout=15)
-                self.last_transport = "WebSocket wss://443"
-                return conn
-            except ImportError:
-                try:
-                    conn = self._async_connect_fallback()
-                    self.last_transport = "WebSocket wss://443 (async)"
-                    return conn
-                except Exception as e:
-                    errors.append(f"ws-async: {type(e).__name__}: {e}")
-            except Exception as e:
-                errors.append(f"ws-sync: {type(e).__name__}: {e}")
-        elif want_ws and not HAS_WEBSOCKETS:
-            errors.append("websockets: библиотека не установлена")
         raise ConnectionError("Не удалось подключиться ни одним способом -> " + " | ".join(errors))
 
     def _log_alive(self, force=False):
@@ -812,26 +912,6 @@ class TwitchChatThread(threading.Thread):
             log(f"[irc] Поток чата остановлен. Принято сообщений за это соединение: {got_msgs}.")
             self.connected_at = None  # чтобы [alive] честно писал «не установлено»
 
-    def _async_connect_fallback(self):
-        """Для старых версий websockets (только async API) — тонкая обёртка."""
-        import asyncio
-        loop = asyncio.new_event_loop()
-        ws = loop.run_until_complete(websockets.connect(TWITCH_WS_URL))
-
-        class Syncish:
-            def __enter__(self_inner):
-                return self_inner
-            def __exit__(self_inner, *a):
-                loop.run_until_complete(ws.close())
-            def send(self_inner, data):
-                loop.run_until_complete(ws.send(data))
-            def recv(self_inner, timeout=None):
-                try:
-                    return loop.run_until_complete(asyncio.wait_for(ws.recv(), timeout))
-                except asyncio.TimeoutError:
-                    return None
-        return Syncish()
-
     def stop(self):
         self.stop_event.set()
 
@@ -1087,16 +1167,14 @@ def main():
         demo = DemoChatThread(store)
         demo.start()
     else:
-        # В боевом режиме поднимаем ОБА источника сообщений:
-        # 1) IRC-поток (TCP 6667 / WebSocket) — основной;
-        # 2) демо-эмулятор, если библиотека websockets не установлена в venv
-        #    сервиса, чтобы в OBS что-то было даже при проблемах с зависимостью.
+        # В боевом режиме IRC-поток — единственный источник сообщений.
+        # Транспорт по умолчанию: WebSocket wss://443 (нативный клиент,
+        # без зависимостей), резерв — TCP 6667. См. _open_conn().
         irc = TwitchChatThread(store, config)
         irc.start()
         if not HAS_WEBSOCKETS:
-            log("[main] Библиотека 'websockets' не найдена — это НЕ ошибка: "
-                "IRC работает по чистому TCP 6667 без зависимостей. "
-                "(WebSocket-транспорт будет включён, если поставить websockets.)")
+            log("[main] Библиотека 'websockets' не установлена — это НЕ ошибка: "
+                "оба транспорта (WSS 443 и TCP 6667) работают нативными клиентами.")
 
     Handler.store = store
     Handler.config = config
