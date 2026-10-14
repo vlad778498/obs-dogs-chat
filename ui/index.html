@@ -6,13 +6,27 @@
 <link rel="stylesheet" href="/static/dogs.css">
 </head>
 <body>
-  <div id="header">
-    <span class="paw">🐾</span>
-    <span id="title">СОБАКИ ЧАТА</span>
-    <span id="counter">0 активных</span>
+  <div id="scene">
+    <!-- газон, по которому собаки бродят у нижнего края экрана -->
+    <div id="lawn"></div>
+
+    <!-- будка справа: из неё собаки выходят на выгул, модераторы сидят на крыше -->
+    <div id="kennel">
+      <div class="roof"><span class="chimney"></span><span class="sign">МОДЕРАТОРЫ</span></div>
+      <div class="body">
+        <div class="door"></div>
+      </div>
+      <div id="mod-roost"><!-- собаки-модераторы на крыше --></div>
+    </div>
+
+    <div id="yard"><!-- бродячие собаки-чатеры --></div>
+
+    <div id="header">
+      <span class="paw">🐾</span>
+      <span id="counter">0 активных</span>
+    </div>
+    <div id="status">подключение…</div>
   </div>
-  <div id="yard"><!-- сюда селятся собаки --></div>
-  <div id="status">подключение к серверу плагинов…</div>
   <script src="/static/dogs.js"></script>
 </body>
 </html>

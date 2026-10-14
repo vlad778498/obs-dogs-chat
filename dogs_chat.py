@@ -75,12 +75,13 @@ class ActivityStore:
         self.users: "OrderedDict[str, dict]" = OrderedDict()  # login -> {name,color,last}
         self.config = config
 
-    def touch(self, login: str, display_name: str = "", color: str = ""):
+    def touch(self, login: str, display_name: str = "", color: str = "", is_mod: bool = False):
         now = time.time()
         with self.lock:
             u = self.users.get(login)
             if u is None:
-                u = {"name": display_name or login, "color": color, "last": now, "count": 0}
+                u = {"name": display_name or login, "color": color, "last": now,
+                     "count": 0, "mod": False}
                 self.users[login] = u
             u["last"] = now
             u["count"] += 1
@@ -88,6 +89,8 @@ class ActivityStore:
                 u["name"] = display_name
             if color:
                 u["color"] = color
+            if is_mod:
+                u["mod"] = True  # статус модератора запоминаем (не сбрасываем)
             # держим словарь упорядоченным по времени последнего сообщения
             self.users.move_to_end(login)
 
@@ -105,6 +108,7 @@ class ActivityStore:
                     "login": login,
                     "name": u["name"],
                     "color": u["color"],
+                    "mod": bool(u.get("mod")),
                     "last_seen": int(u["last"]),
                     "messages": u["count"],
                     "seconds_ago": int(time.time() - u["last"]),
@@ -237,7 +241,10 @@ class TwitchChatThread(threading.Thread):
                         login = tags.get("login", nick_user.lower())
                         if login in ("ircv3",):
                             continue
-                        self.store.touch(login, tags.get("display-name", nick_user), tags.get("color", ""))
+                        badges = tags.get("badges", "")
+                        is_mod = "moderator/1" in badges or "broadcaster/1" in badges
+                        self.store.touch(login, tags.get("display-name", nick_user),
+                                         tags.get("color", ""), is_mod=is_mod)
             print("[irc] Поток чата остановлен.")
 
     def _async_connect_fallback(self):
@@ -273,6 +280,8 @@ DEMO_NAMES = [
     "husky_drama", "corgi_butt", "beagle_ruff", "mastiff_max", "terrier_tina",
     "retriever_rio", "spaniel_sam", "bulldog_boris", "shepherd_sha", "mutley99",
 ]
+# несколько "модераторов" для демонстрации будки
+DEMO_MODS = ["mod_polkhan", "mod_sharik", "streamer_boss"]
 
 
 class DemoChatThread(threading.Thread):
@@ -288,9 +297,12 @@ class DemoChatThread(threading.Thread):
         for n in DEMO_NAMES:
             offset = random.randint(0, 7200)  # 0..2 часа назад
             self.store._seed(n, time.time() - offset)
+        for n in DEMO_MODS:
+            self.store._seed(n, time.time() - random.randint(0, 600))
+            self.store.touch(n.lower(), n, is_mod=True)
         while not self.stop_event.is_set():
-            name = random.choice(DEMO_NAMES)
-            self.store.touch(name.lower(), name)
+            name = random.choice(DEMO_NAMES + DEMO_MODS)
+            self.store.touch(name.lower(), name, is_mod=(name in DEMO_MODS))
             time.sleep(random.uniform(0.5, 3.0))
 
     def stop(self):
@@ -300,7 +312,7 @@ class DemoChatThread(threading.Thread):
 # добавим метод seed в ActivityStore
 def _seed(self, login, ts):
     with self.lock:
-        self.users[login] = {"name": login, "color": "", "last": ts, "count": 1}
+        self.users[login] = {"name": login, "color": "", "last": ts, "count": 1, "mod": False}
 ActivityStore._seed = _seed
 
 
