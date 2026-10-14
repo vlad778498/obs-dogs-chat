@@ -66,17 +66,22 @@
         }
       }
       if (urls.length) return urls;
-      // нужной стороны нет — берём другую (applySprite отразит)
+      // кадры только другой стороны — переупаковываем их в цикл с правильной
+      // нумерацией и flip=1. Важно: если у автора есть walk-0-left, но нет
+      // walk-0-right, кадр 0 не должен выпадать из цикла (старый код терял
+      // его, и при ходьбе вправо анимация начиналась с шага 2).
+      const mirror = [];
       for (let i = startIdx; i <= 8; i++) {
         const exact = b + "-" + pose + "-" + i + "-" + other + ".png";
-        if (this.has(exact)) { urls.push("/assets/" + exact + "?flip=1"); continue; }
+        if (this.has(exact)) { mirror[i] = "/assets/" + exact + "?flip=1"; continue; }
         const loose = this._looseFrame(b, pose, i, other);
-        if (loose) { urls.push(loose + "?flip=1"); continue; }
+        if (loose) { mirror[i] = loose + "?flip=1"; continue; }
         if (i === 0) {
           const legacy = b + "-" + pose + "-" + other + ".png";
-          if (this.has(legacy)) urls.push("/assets/" + legacy + "?flip=1");
+          if (this.has(legacy)) mirror[i] = "/assets/" + legacy + "?flip=1";
         }
       }
+      for (const u of mirror) if (u) urls.push(u);
       return urls;
     },
 
@@ -109,17 +114,21 @@
     // нарисованная базовая анимация работала для всех пород без PNG.
     // strict=true: только кадры самой позы, БЕЗ подстановки idle-фолбэка
     // (нужно движку, чтобы отличать «есть walk» от «walk нет, идём в idle»).
-    framesFor(breed, pose, dir, strict) {
-      const key = breed + "|" + pose + "|" + dir + (strict ? "|s" : "");
+    // policy="strict-pose" (используется движком при ходьбе): если у позы нет
+    // собственных кадров ни у породы, ни у базовой dog-* — вернуть пустой
+    // список. idle НЕ подмешивается в walk-цикл никогда.
+    framesFor(breed, pose, dir, strict, policy) {
+      const key = breed + "|" + pose + "|" + dir + (strict ? "|s" : "") + (policy === "strict-pose" ? "|p" : "");
       if (this._frameCache.has(key)) return this._frameCache.get(key);
       const b = String(breed).toLowerCase(), d = String(dir).toLowerCase();
       let urls = this._poseFrames(b, pose, d, 0);
-      if (!strict) {
+      if (!strict && policy !== "strict-pose") {
         if (!urls.length && pose !== "idle") urls = this._poseFrames(b, "idle", d, 0);
       }
       if (!urls.length && b !== "dog") {
         urls = this._poseFrames("dog", pose, d, 0);
-        if (!strict && !urls.length && pose !== "idle") urls = this._poseFrames("dog", "idle", d, 0);
+        if (!strict && policy !== "strict-pose" && !urls.length && pose !== "idle")
+          urls = this._poseFrames("dog", "idle", d, 0);
       }
       this._frameCache.set(key, urls);
       return urls;
@@ -377,9 +386,23 @@
     return areaW() - kw - rand(0, 40);
   }
 
+  // Паузы в idle: дошедшая до цели собака иногда «задумывается» на 2–6 сек.
+  // Частота и длительность — эти константы.
+  const PAUSE_CHANCE = 0.55;   // вероятность паузы при выборе новой цели
+  const PAUSE_MIN_MS = 2000;
+  const PAUSE_MAX_MS = 6000;
+
   function pickTarget(d) {
     const w = areaW(), dw = dogW();
-    d.target = rand(4, Math.max(6, w - dw - 4));
+    if (Math.random() < PAUSE_CHANCE) {
+      // пауза: цель = текущая позиция → moving=false → idle-цикл;
+      // через случайное время собака снова выберет цель
+      d.target = d.x;
+      d.pausedUntil = Date.now() + rand(PAUSE_MIN_MS, PAUSE_MAX_MS);
+    } else {
+      d.target = rand(4, Math.max(6, w - dw - 4));
+      d.pausedUntil = 0;
+    }
     d.running = Math.random() < 0.18;                   // иногда zoomies
     d.speed = d.running ? rand(140, 260) : rand(35, 80); // px/сек
   }
@@ -401,7 +424,12 @@
       const step = d.speed * dt;
       if (Math.abs(dx) <= step) {
         d.x = d.target;
-        if (Math.random() < 0.35) pickTarget(d);        // дошла — куда идём дальше
+        // после паузы в idle — снова выбираем цель; без пауз dog-idle всё
+        // равно виден: цель достигается, собака стоит до следующего тика
+        if (!d.pausedUntil || Date.now() >= d.pausedUntil) {
+          d.pausedUntil = 0;
+          pickTarget(d);                                // дошла — куда идём дальше
+        }
       } else {
         d.x += Math.sign(dx) * step;
       }
@@ -496,7 +524,7 @@
     const d = {
       el, spriteEl: el.querySelector(".sprite"),
       x: spawnX(), target: 0, speed: 60, running: false,
-      leaving: false, faceLeft: true, data, st: {},
+      leaving: false, faceLeft: true, data, st: {}, pausedUntil: 0,
     };
     el.querySelector(".name").textContent = data.name || login;
     pickTarget(d);
