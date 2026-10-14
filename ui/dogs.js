@@ -51,12 +51,12 @@
         this.frameMs = j.frame_duration_ms || 250;
       } catch (e) { /* сеть ещё не готова — останутся заглушки */ }
 
-      this.dogArt = this.has("dog-idle-right.png") || this.has("dog-walk-right.png") ||
-                    this.has("dog-idle-left.png") || this.has("dog-walk-left.png");
-      this.modArt = this.has("mod-idle-right.png") || this.has("mod-idle-left.png") ||
-                    this.has("mod-walk-right.png") || this.has("mod-walk-left.png");
+      const pngs = [...this.files].filter((f) => f.endsWith(".png"));
+      // "нарисовано" = любой PNG с префиксом dog-/mod- (любая порода тоже годится)
+      this.dogArt = pngs.some((f) => /^(dog|labrador|shepherd|husky|poodle|corgi|beagle|bulldog|dalmatian|greyhound|pug)-/.test(f));
+      this.modArt = pngs.some((f) => /^mod-/.test(f));
       this.kennelArt = this.has("kennel.png");
-      this.runArt = this.has("dog-run-right.png") || this.has("dog-run-left.png");
+      this.runArt = pngs.some((f) => /-run-(left|right)\.png$/.test(f));
 
       kennel.classList.toggle("has-art", this.kennelArt);
       renderPlaceholderKennel();
@@ -70,7 +70,7 @@
         assetsInfo.textContent = parts.join(" · ");
       }
       // узнаём реальные пропорции PNG, чтобы aspect-ratio в CSS совпал
-      measureSprite("dog-idle-right.png", (w, h) => {
+      measureSprite(firstDogPng(), (w, h) => {
         this.ratio = w / h;
         document.documentElement.style.setProperty("--sprite-ar", this.ratio.toFixed(4));
       });
@@ -83,8 +83,18 @@
     },
   };
 
+  // первая доступная png собаки — для замера пропорций спрайта
+  function firstDogPng() {
+    const order = ["dog-idle-right.png", "dog-walk-right.png"];
+    for (const n of order) if (Assets.has(n)) return n;
+    for (const n of [...Assets.files].sort()) {
+      if (n.endsWith(".png") && !/^kennel/.test(n) && /-(idle|walk|run|sleep)-/.test(n)) return n;
+    }
+    return "dog-idle-right.png";
+  }
+
   function measureSprite(name, cb) {
-    if (!Assets.has(name)) return;
+    if (!name || !Assets.has(name)) return;
     let img = metrics.querySelector('img[data-name="' + name + '"]');
     if (img && img.naturalWidth) { cb(img.naturalWidth, img.naturalHeight); return; }
     img = document.createElement("img");
@@ -108,31 +118,106 @@
   }
 
   // =========================================================================
-  // Выбор файла спрайта: поза + направление, с фолбэками и авто-зеркалированием
+  // Породы собак: один чатер = одна порода (детерминированно по нику)
   // =========================================================================
-  // возвращает {url, flip} или null (тогда рисуем эмодзи-заглушку)
-  function spriteFor(prefix, pose, dir) { // prefix: "dog"|"mod"; pose: idle|walk|run
-    const other = dir === "left" ? "right" : "left";
-    const cands = [
-      [prefix + "-" + pose + "-" + dir + ".png", false],   // идеал: нужная сторона
-      [prefix + "-" + pose + "-" + other + ".png", true],  // зеркалим существующую
-    ];
-    if (pose !== "idle") { // walk/run отсутствуют — используем idle
-      cands.push([prefix + "-idle-" + dir + ".png", false],
-                 [prefix + "-idle-" + other + ".png", true]);
-    }
-    for (const [f, flip] of cands) {
-      if (Assets.has(f)) return { url: "/assets/" + f, flip };
-    }
-    return null;
+  // Порода = префикс имени PNG-файла: <breed>-idle-right.png и т.д.
+  // Список легко расширять — добавьте строку и нарисуйте файлы с таким
+  // префиксом; движок сам начнёт их подхватывать.
+  const BREEDS = {
+    labrador:  "labrador",   // 🦮 ретривер
+    shepherd:  "shepherd",   // 🐕‍🦺 овчарка
+    husky:     "husky",      // 🐺 хаски
+    poodle:    "poodle",     // 🐩 пудель
+    corgi:     "corgi",
+    beagle:    "beagle",
+    bulldog:   "bulldog",
+    dalmatian: "dalmatian",
+    greyhound: "greyhound",
+    pug:       "pug",
+  };
+  const MOD_BREEDS = ["shepherd", "labrador", "husky"]; // служебные на крышу
+  const FALLBACK_EMOJI = ["🐶", "🐕", "🦮", "🐕‍🦺", "🐩", "🐺"];
+
+  function hashStr(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h;
+  }
+  // login -> имя породы (стабильно между перезагрузками страницы/сервера)
+  function breedNameFor(login, mod) {
+    const key = String(login).toLowerCase();
+    if (mod) return MOD_BREEDS[hashStr(key) % MOD_BREEDS.length];
+    const names = Object.keys(BREEDS);
+    return names[hashStr(key) % names.length];
+  }
+  // login -> emoji заглушки (пока PNG этой породы не нарисованы)
+  function breedEmoji(login, mod) {
+    const key = String(login).toLowerCase();
+    if (mod) return "🐕‍🦺";
+    return FALLBACK_EMOJI[hashStr(key) % FALLBACK_EMOJI.length];
   }
 
-  function applySprite(spriteEl, holderEl, prefix, pose, dir, tintCss) {
-    const s = spriteFor(prefix, pose, dir);
+  // =========================================================================
+  // Выбор файла спрайта: порода + поза + направление, с фолбэками
+  // =========================================================================
+  // Порядок поиска (первое совпадение выигрывает):
+  //   1. <breed>-<pose>-<dir>.png        точный файл нужной стороны
+  //   2. <breed>-<pose>-<other>.png      зеркалим существующую сторону
+  //   3. <breed>-idle-...                позы нет — берём idle породы
+  //   4. dog-<pose>-<dir>.png            базовый универсальный спрайт
+  //   5. любой файл содержащий "<breed>" (нестандартные имена автора)
+  // Если ничего нет -> null -> показываем emoji-заглушку породы.
+  function findLooseBreedFile(breed, dir) {
+    const b = breed.toLowerCase();
+    const other = dir === "left" ? "right" : "left";
+    // совпадение по началу имени файла (husky-walk-left.png, husky_walk_left.png и т.п.)
+    const files = [...Assets.files].filter((f) => f.toLowerCase().startsWith(b + "-") ||
+                                                 f.toLowerCase().startsWith(b + "_"));
+    const hit = files.find((f) => f.toLowerCase().includes(dir)) ||
+                files.find((f) => f.toLowerCase().includes(other));
+    if (!hit) return null;
+    return { file: hit, flip: !hit.toLowerCase().includes(dir) };
+  }
+
+  function spriteFor(breed, pose, dir) {
+    const b = BREEDS[breed] || breed || "dog";
+    const other = dir === "left" ? "right" : "left";
+    const chain = [];
+    // файлы породы
+    chain.push([b + "-" + pose + "-" + dir + ".png", false]);
+    chain.push([b + "-" + pose + "-" + other + ".png", true]);
+    if (pose !== "idle") {
+      chain.push([b + "-idle-" + dir + ".png", false]);
+      chain.push([b + "-idle-" + other + ".png", true]);
+    }
+    for (const [f, flip] of chain) {
+      if (Assets.has(f)) return { url: "/assets/" + f, flip };
+    }
+    // свободный поиск файлов породы ДО базового dog-*
+    const loose = findLooseBreedFile(b, dir);
+    if (loose) return { url: "/assets/" + loose.file, flip: loose.flip };
+    // базовый universal-спрайт dog-*
+    const base = [
+      ["dog-" + pose + "-" + dir + ".png", false],
+      ["dog-" + pose + "-" + other + ".png", true],
+    ];
+    if (pose !== "idle") {
+      base.push(["dog-idle-" + dir + ".png", false]);
+      base.push(["dog-idle-" + other + ".png", true]);
+    }
+    for (const [f, flip] of base) {
+      if (Assets.has(f)) return { url: "/assets/" + f, flip };
+    }
+    return null; // -> emoji-заглушка
+  }
+
+  function applySprite(spriteEl, holderEl, breed, pose, dir, tintCss) {
+    const s = spriteFor(breed, pose, dir);
     if (!s) {
       holderEl.classList.add("placeholder");
       spriteEl.style.backgroundImage = "";
-      spriteEl.textContent = breedFor(holderEl.dataset.login || "", prefix === "mod");
+      spriteEl.textContent = breedEmoji(holderEl.dataset.login || "",
+                                        holderEl.classList.contains("mod-dog"));
       return;
     }
     holderEl.classList.remove("placeholder");
@@ -141,21 +226,6 @@
     // собственное зеркало только когда файл отражён относительно нужной стороны
     spriteEl.style.transform = s.flip ? "scaleX(-1)" : "";
     if (tintCss) spriteEl.style.setProperty("--tint-rot", tintCss);
-  }
-
-  // =========================================================================
-  // "Порода" для эмодзи-заглушки: один чатер = одна собака
-  // =========================================================================
-  const BREEDS = ["🐶", "🐕", "🦮", "🐕‍🦺", "🐩", "🐺"];
-  const MOD_BREEDS = ["🐕‍🦺", "🦮", "🐺"]; // служебные — для модераторов
-  function hashStr(s) {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-    return h;
-  }
-  function breedFor(login, mod) {
-    const list = mod ? MOD_BREEDS : BREEDS;
-    return list[hashStr(String(login).toLowerCase()) % list.length];
   }
 
   // тонировка собаки в цвет ника чатера (Toca Boca style).
@@ -244,11 +314,11 @@
       for (const [, d] of dogs) { if (!d.leaving) updateDogFrame(d); }
       for (const [, el] of mods) {
         const st = el._st || {};
-        const pose = frameToggle && (Assets.has("mod-walk-right.png") ||
-                                     Assets.has("mod-walk-left.png")) ? "walk" : "idle";
+        const hasModWalk = [...Assets.files].some((f) => /^mod-walk-(left|right)\.png$/.test(f));
+        const pose = frameToggle && hasModWalk ? "walk" : "idle";
         if (st.pose !== pose) {
           st.pose = pose; el._st = st;
-          applySprite(el.querySelector(".sprite"), el, "mod", pose, "right", st.tint);
+          applySprite(el.querySelector(".sprite"), el, st.breed || "shepherd", pose, "right", st.tint);
         }
       }
     }, Math.max(60, Assets.frameMs || 250));
@@ -256,7 +326,7 @@
 
   function updateDogFrame(d) {
     const moving = Math.abs(d.target - d.x) > 2;
-    const hasWalk = Assets.has("dog-walk-right.png") || Assets.has("dog-walk-left.png");
+    const hasWalk = [...Assets.files].some((f) => /-walk-(left|right)\.png$/.test(f));
     let pose;
     if (!moving) pose = "idle";
     else if (!hasWalk) pose = "idle";                  // walk-кадров нет — без дёрганья
@@ -266,7 +336,7 @@
     const st = d.st || (d.st = {});
     if (st.pose === pose && st.dir === dir) return;
     st.pose = pose; st.dir = dir;
-    applySprite(d.spriteEl, d.el, "dog", pose, dir, st.tint);
+    applySprite(d.spriteEl, d.el, st.breed || "mutt", pose, dir, st.tint);
   }
 
   // =========================================================================
@@ -286,7 +356,9 @@
     if (!data) return;
     const tint = tintFor(data.color);
     d.el.classList.toggle("tinted", !!tint);
-    (d.st = d.st || {}).tint = tint || "";
+    const st = (d.st = d.st || {});
+    st.tint = tint || "";
+    st.breed = breedNameFor(d.el.dataset.login, false); // порода привязана к нику
     updateDogFrame(d);
   }
 
@@ -342,11 +414,13 @@
     const tint = tintFor(data.color);
     el._st = el._st || {};
     el._st.tint = tint || "";
-    applySprite(el.querySelector(".sprite"), el, "mod", "idle", "right", tint);
+    el._st.breed = breedNameFor(login, true); // служебная порода для крышы
+    applySprite(el.querySelector(".sprite"), el, el._st.breed, "idle", "right", tint);
   }
   function refreshModSprite(el) {
     const st = el._st || {};
-    applySprite(el.querySelector(".sprite"), el, "mod", st.pose || "idle", "right", st.tint);
+    applySprite(el.querySelector(".sprite"), el, st.breed || "shepherd",
+                st.pose || "idle", "right", st.tint);
   }
 
   // =========================================================================

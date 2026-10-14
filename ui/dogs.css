@@ -17,7 +17,7 @@ html, body {
   font-family: "Segoe UI", Arial, sans-serif;
   color: var(--text);
   background: transparent;   /* OBS прозрачный фон */
-  overflow: hidden;
+  overflow: visible;         /* подписи-ники не обрезаются нижним краем */
 }
 
 #scene { position: relative; width: 100vw; height: 100vh; }
@@ -78,6 +78,7 @@ html, body {
 
 /* --- зона выгула: только горизонтальное движение по нижнему краю -------------- */
 #yard {
+  overflow: visible;
   position: absolute; left: 0; right: 0; bottom: var(--ground);
   height: var(--dog-size);
   z-index: 3; pointer-events: none;
@@ -86,6 +87,7 @@ html, body {
 .dog {
   position: absolute; bottom: 0;               /* пол фиксирован — только left меняется */
   height: var(--dog-size); aspect-ratio: var(--sprite-ar, 1);
+  overflow: visible;                           /* ник под собакой не обрезается */
   will-change: left;
   transition: left 1.2s linear;               /* плавная ходьба; длительность ставит JS */
 }
@@ -110,12 +112,14 @@ html, body {
 .dog.face-left.placeholder .sprite { transform: scaleX(-1); }
 .dog.running.placeholder .sprite { animation-duration: .7s; }
 
-/* подпись — ТОЛЬКО ник, без обводок/плашек */
+/* подпись — ТОЛЬКО ник, без обводок/плашек.
+ * ВАЖНО: подпись лежит ВНУТРИ карточки собаки (.dog имеет overflow:visible),
+ * поэтому не обрезается ни зоной выгула, ни краем экрана. */
 .name {
-  position: absolute; left: 50%; bottom: -15px; transform: translateX(-50%);
-  font-size: 11px; font-weight: 600; color: var(--text);
-  white-space: nowrap; pointer-events: none;
-  text-shadow: 0 1px 2px rgba(0,0,0,.9);   /* читаемость на любом фоне */
+  position: absolute; top: 100%; left: 50%; transform: translate(-50%, 2px);
+  font-size: 12px; font-weight: 700; color: #ffffff;
+  white-space: nowrap; pointer-events: none; line-height: 1;
+  text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 6px rgba(0,0,0,.7);
 }
 
 @keyframes appear {
