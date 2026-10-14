@@ -295,11 +295,12 @@ class RawTCPClient:
 
 # Максимально допустимый простой БЕЗ ЛЮБОГО входящего пакета от сервера.
 # После него соединение считается мёртвым (см. watchdog в _connect_and_read).
-# Twitch держит idle-соединения живыми и слал PING примерно раз в минуту;
-# отсутствие любых байтов 75+ секунд почти гарантированно означает, что
-# обратный путь потерялся. Значение можно переопределить в settings.json:
+# ВАЖНО: watchdog рвёт соединение ТОЛЬКО если наш собственный PING остался без
+# ответа. Пока Twitch отвечает на PING — TCP-путь живой и сообщение чата может
+# прийти в любую секунду, поэтому соединение НЕ разрывается, даже если в чате
+# тихо несколько минут подряд. Значение можно переопределить в settings.json:
 # "irc_watchdog_seconds".
-WATCHDOG_S_DEFAULT = 75
+WATCHDOG_S_DEFAULT = 120
 
 
 def parse_tags(raw_tags: str) -> dict:
@@ -362,6 +363,7 @@ class TwitchChatThread(threading.Thread):
         self.msgs_this_conn = 0        # PRIVMSG за текущее соединение
         self.last_msg_ts = None        # время последнего принятого сообщения
         self.last_ping_pong = None     # время последнего PONG на серверный PING
+        self.last_pong_reply = None    # время ответа PONG от Twitch на НАШ PING
         self.last_alive_log = 0.0      # когда последний раз печатали [alive]
         # --- расширенная диагностика (коммит 9d34f0e, которого не было в репо) ---
         self.rx_bytes = 0              # байт принято за текущее соединение
@@ -483,10 +485,13 @@ class TwitchChatThread(threading.Thread):
         since_msg = "-" if self.last_msg_ts is None else f"{int(now - self.last_msg_ts)} c назад"
         since_pp = "-" if self.last_ping_pong is None else f"{int(now - self.last_ping_pong)} c назад"
         since_rx = "-" if self.rx_last_ts is None else f"{int(now - self.rx_last_ts)} c назад"
+        since_pr = ("-" if self.last_pong_reply is None
+                    else f"{int(now - self.last_pong_reply)} c назад")
         active = self.store.total_active()
         log(f"[alive] Соединение #{self.conn_id} ({self.last_transport}) активно {age} c; "
             f"PRIVMSG за это соединение: {self.msgs_this_conn} (всего {self.total_msgs}); "
             f"последнее сообщение: {since_msg}; последний PONG на PING сервера: {since_pp}; "
+            f"ответ Twitch на наш PING: {since_pr}; "
             f"активных чатеров сейчас: {active}")
         log(f"[diag] За соединение #{self.conn_id}: байт принято {self.rx_bytes}, строк {self.rx_lines}; "
             f"любой входящий пакет был: {since_rx}; PING от сервера: {self.server_pings}, "
@@ -546,6 +551,7 @@ class TwitchChatThread(threading.Thread):
             self.rx_last_ts = None
             self.server_pings = 0
             self.my_pongs = 0
+            self.last_pong_reply = None
             self.irc_cmds_seen = {}
             self._log_alive(force=True)   # сразу при подключении — видно, что всё поднялось
             got_msgs = 0
@@ -569,38 +575,40 @@ class TwitchChatThread(threading.Thread):
                     break
                 if msg is None:
                     now_w = time.time()
-                    # --- принудительная ротация соединения при «тишине» ---
-                    # Если ЦЕЛЫХ 90 секунд от Twitch не пришло НИ ОДНОГО байта
-                    # (даже PING/NAMES — т.е. сервер перестал слать нам трафик,
-                    # что бывает с анонимными justinfan-подключениями), то
-                    # переподключение само по себе ничего не даст — но новый
-                    # TCP-коннект с новым ephemeral портом часто «сбрасывает»
-                    # состояние троттлинга на стороне Twitch/CDN. Поэтому рвём
-                    # и поднимаем заново, а не ждём вечно.
-                    if now_w - last_rx_wall > 90:
-                        log(f"[irc] 90 c полного молчания от сервера — переподключение "
-                            f"(принудительная ротация TCP-сессии).")
-                        break
+                    # --- «тишина» больше НЕ рвёт соединение ---
+                    # Раньше при 60-90 секундах без входящих байтов мы
+                    # принудительно переподключались. Это было избыточно: пока
+                    # Twitch отвечает на наши PING, TCP-путь живой, и первое же
+                    # сообщение чата приходит по этому же соединению. Разрыв
+                    # «на всякий случай» лишь создавал окна в 5 секунд без чата.
+                    # Теперь предупреждаем в лог, но сидим и ждём; разрыв
+                    # происходит только настоящим watchdog'ем ниже — если
+                    # сервер перестал ОТВЕЧАТЬ на наши PING (half-open).
                     if now_w - last_rx_wall > 60 and not idle_logged_60:
                         idle_logged_60 = True
                         cmds = ", ".join(f"{k}:{v}" for k, v in sorted(
                             self.irc_cmds_seen.items(), key=lambda kv: -kv[1])[:12]) or "-"
-                        log(f"[stall] ВНИМАНИЕ: 60+ c нет НИ ОДНОГО пакета от Twitch. "
-                            f"Команды за соединение были: {cmds}")
+                        log(f"[stall] Тишина 60+ c (чат молчит или Twitch не шлёт "
+                            f"PRIVMSG). Соединение НЕ рвём — ждём ответов на PING. "
+                            f"Команды за соединение: {cmds}")
                     if now_w - last_keepalive > 25:
                         # Активный keep-alive + СТОРОЖЕВОЙ ТАЙМЕР.
-                        # Шлём PING и повторный JOIN; нормальный сервер обязан
-                        # ответить (на PING своим PING, на JOIN — 353/366 или
-                        # NOTICE "already in channel"). Если с момента
-                        # последнего ВХОДЯЩЕГО пакета прошло больше WATCHDOG_S
-                        # — соединение half-open (Twitch тихо убит, NAT съел
-                        # обратный путь и т.п.), и send() этого не заметит:
-                        # запись в мёртвый TCP-сокет «успешна». Поэтому рвём
-                        # сокет сами — recv бросит ошибку, цикл переподнимется.
+                        # Шлём PING каждые 25 с. Watchdog срабатывает ТОЛЬКО
+                        # если сервер перестал отвечать нам ЛЮБЫМИ байтами
+                        # дольше watchdog_s — т.е. наш PING остался без ответа
+                        # и соединение half-open (Twitch/NAT тихо убили обратный
+                        # путь; send() в такой сокет «успешен», поэтому рвём
+                        # сами). Обычная тишина в чате watchdog не трогает.
                         since_rx2 = now_w - last_rx_wall
+                        # Если Twitch отвечает на наши PING (:dogs-chat) — путь
+                        # точно живой, даже когда в чате молчат минутами. Такое
+                        # соединение НЕ рвём никогда; разрыв только при реальном
+                        # отсутствии любых ответов сервера.
+                        pong_ok = (self.last_pong_reply is not None and
+                                   now_w - self.last_pong_reply < 70)
                         watchdog_s = max(40, int(self.config.get(
                             "irc_watchdog_seconds", WATCHDOG_S_DEFAULT)))
-                        if since_rx2 > watchdog_s:
+                        if since_rx2 > watchdog_s and not pong_ok:
                             log(f"[irc] Watchdog: {int(since_rx2)} c нет НИ ОДНОГО "
                                 f"ответа сервера (последняя попытка PING была "
                                 f"подтверждена? {'нет' if unconfirmed else 'да'}). "
@@ -686,6 +694,11 @@ class TwitchChatThread(threading.Thread):
                     nick_user, tags, cmd, params, trailing = parsed
                     # учёт ВСЕХ команд от сервера — для [cmds] в диагностике
                     self.irc_cmds_seen[cmd] = self.irc_cmds_seen.get(cmd, 0) + 1
+                    if cmd == "PONG":
+                        # Twitch ответил на наш собственный PING (:dogs-chat)
+                        # — значит TCP-путь туда-обратно живой даже при полной
+                        # тишине в чате; watchdog не должен рвать такое соединение
+                        self.last_pong_reply = time.time()
                     if cmd == "PRIVMSG" and nick_user:
                         # игнорируем ботов/сервера, если вдруг
                         login = tags.get("login", nick_user.lower())
