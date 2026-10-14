@@ -346,6 +346,14 @@ class TwitchChatThread(threading.Thread):
         self.config = config
         self.stop_event = threading.Event()
         self.last_transport = "?"   # фактический транспорт текущего соединения (для лога)
+        # --- диагностика "соединение живо?" (пишется в journal каждые 120 c) ---
+        self.connected_at = None       # когда установлено текущее соединение
+        self.conn_id = 0               # счётчик переподключений
+        self.total_msgs = 0            # PRIVMSG за всё время работы потока
+        self.msgs_this_conn = 0        # PRIVMSG за текущее соединение
+        self.last_msg_ts = None        # время последнего принятого сообщения
+        self.last_ping_pong = None     # время последнего PONG на серверный PING
+        self.last_alive_log = 0.0      # когда последний раз печатали [alive]
 
     def run(self):
         channels = [c.strip().lstrip("#").lower() for c in self.config.get("channels", []) if c.strip()]
@@ -415,6 +423,26 @@ class TwitchChatThread(threading.Thread):
             errors.append("websockets: библиотека не установлена")
         raise ConnectionError("Не удалось подключиться ни одним способом -> " + " | ".join(errors))
 
+    def _log_alive(self, force=False):
+        """Каждые 120 секунд писать в journal сводку: живо ли соединение и
+        идут ли сообщения. Если что-то из этого перестанет работать — будет
+        видно НЕВОЗМОЖНО пропустить прямо в `journalctl -u dogs-chat -f`."""
+        now = time.time()
+        if not force and now - self.last_alive_log < 120:
+            return
+        self.last_alive_log = now
+        if self.connected_at is None:
+            log("[alive] IRC-соединение НЕ установлено (переподключение/ошибка).")
+            return
+        age = int(now - self.connected_at)
+        since_msg = "-" if self.last_msg_ts is None else f"{int(now - self.last_msg_ts)} c назад"
+        since_pp = "-" if self.last_ping_pong is None else f"{int(now - self.last_ping_pong)} c назад"
+        active = self.store.total_active()
+        log(f"[alive] Соединение #{self.conn_id} ({self.last_transport}) активно {age} c; "
+            f"PRIVMSG за это соединение: {self.msgs_this_conn} (всего {self.total_msgs}); "
+            f"последнее сообщение: {since_msg}; последний PONG на PING сервера: {since_pp}; "
+            f"активных чатеров сейчас: {active}")
+
     def _connect_and_read(self, nick: str, channels: list):
         conn = self._open_conn()
 
@@ -436,9 +464,15 @@ class TwitchChatThread(threading.Thread):
             for ch in channels:
                 send(f"JOIN #{ch}")
             log(f"[irc] Подключено ({self.last_transport}). Каналы: {', '.join(channels)}")
+            # --- счётчики для диагностики (см. _log_alive) ---
+            self.conn_id += 1
+            self.connected_at = time.time()
+            self.msgs_this_conn = 0
+            self._log_alive(force=True)   # сразу при подключении — видно, что всё поднялось
             got_msgs = 0
             last_keepalive = time.time()
             while not self.stop_event.is_set():
+                self._log_alive()          # раз в 2 минуты строчка [alive] в journal
                 try:
                     msg = conn.recv(timeout=1.0)
                 except TimeoutError:
@@ -451,10 +485,15 @@ class TwitchChatThread(threading.Thread):
                     break
                 if msg is None:
                     if time.time() - last_keepalive > 25:
-                        # активный keep-alive: Twitch закрывает соединение, если
-                        # от нас долго нет ни PONG, ни JOIN. Периодический повторный
-                        # JOIN безвреден (сервер ответит "already in channel").
+                        # Активный keep-alive. Раньше тут был повторный JOIN
+                        # («already in channel» безвреден) — но многие NAT/файрволы
+                        # НЕ считают IRC-трафик «активным», если это не PING/PONG
+                        # (стандартные коннектор NAT отслеживают именно эти команды),
+                        # и тихо рвут «безразличный» коннект ровно через ~120 секунд
+                        # симметричного таймаута. Теперь шлём собственный PING —
+                        # на него реагируют и NAT, и сервер (ответным PING -> PONG).
                         try:
+                            send("PING :dogs-chat")
                             for ch in channels:
                                 send(f"JOIN #{ch}")
                         except Exception:
@@ -465,12 +504,14 @@ class TwitchChatThread(threading.Thread):
                     msg = msg.decode("utf-8", "replace")
                 # PING от сервера может прийти в любом сообщении — отвечаем сразу,
                 # иначе Twitch закрывает молчаливое соединение (~через минуту)
-                if msg.startswith("PING"):
-                    send("PONG :tmi.twitch.tv")
+                if "PING" in msg:
+                    for line in msg.split("\r\n"):
+                        if line.startswith("PING"):
+                            send("PONG :tmi.twitch.tv")
+                            self.last_ping_pong = time.time()
                 for line in msg.split("\r\n"):
                     if line.startswith("PING"):
-                        send("PONG :tmi.twitch.tv")
-                        continue
+                        continue  # уже обработано выше
                     # служебные сообщения пишем в лог — по ним видно,
                     # почему канал мог не пустить (например "No such channel")
                     if line.startswith(":") and ("NOTICE" in line or "ERR" in line.split()[1:2]):
@@ -487,9 +528,13 @@ class TwitchChatThread(threading.Thread):
                         badges = tags.get("badges", "")
                         is_mod = "moderator/1" in badges or "broadcaster/1" in badges
                         got_msgs += 1
+                        self.total_msgs += 1
+                        self.msgs_this_conn += 1
+                        self.last_msg_ts = time.time()
                         self.store.touch(login, tags.get("display-name", nick_user),
                                          tags.get("color", ""), is_mod=is_mod)
-            log(f"[irc] Поток чата остановлен. Принято сообщений: {got_msgs}.")
+            log(f"[irc] Поток чата остановлен. Принято сообщений за это соединение: {got_msgs}.")
+            self.connected_at = None  # чтобы [alive] честно писал «не установлено»
 
     def _async_connect_fallback(self):
         """Для старых версий websockets (только async API) — тонкая обёртка."""
