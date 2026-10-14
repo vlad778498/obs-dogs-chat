@@ -28,7 +28,7 @@ python3 tests/twitch_connect_test.py --channel mamilokuchii --nick мой_ник
 # длительнее, например 10 минут (лучше ловит редкие обрывы)
 python3 tests/twitch_connect_test.py --duration 600
 
-# через WebSocket 443 вместо TCP 6667 (реализован на чистом Python, pip НЕ нужен)
+# через WebSocket 443 вместо TCP 6667 (нужен: pip install websockets)
 python3 tests/twitch_connect_test.py --wss
 ```
 

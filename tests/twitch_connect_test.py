@@ -6,8 +6,7 @@ twitch_connect_test.py — независимая проверка соедин�
 Диагностирует проблему «сообщения перестают появляться через ~60-120 секунд»:
   1. DNS      — резолвинг irc.chat.twitch.tv
   2. TCP      — подключение к порту 6667 (то же, что делает dogs_chat.py)
-  3. TLS/WSS  — подключение к irc-ws.chat.twitch.tv:443 (чистый Python, ssl+websocket,
-                БЕЗ сторонних пакетов — работает даже при externally-managed pip)
+  3. TLS/WSS  — подключение к irc-ws.chat.twitch.tv:443 (нужен пакет websockets)
   4. IRC      — CAP/JOIN как dogs_chat.py, счёт PRIVMSG по минутам
   5. KEEPALIVE— PING каждые 30 c + контроль ответов сервера
   6. WATCHDOG— детект half-open: 125 c без единого байта = сокет мёртв
@@ -82,147 +81,8 @@ def parse_irc_line(line):
     return {"tags": tags, "prefix": prefix, "command": cmd, "params": params}
 
 
-class WssClient:
-    """Минимальный WebSocket-клиент (RFC 6455) поверх стандартного ssl-сокета.
-    Никаких сторонних пакетов не требует — работает даже там, где pip заблокирован
-    (externally-managed-environment / PEP 668). Twitch отдаёт только текстовые кадры;
-    бинарные/фрагментированные тоже поддерживаем, ping/pong/ping-response обрабатываем."""
-
-    OPCODES_CONT, OPCODES_TEXT, OPCODES_BIN = 0x0, 0x1, 0x2
-    OPCODES_CLOSE, OPCODES_PING, OPCODES_PONG = 0x8, 0x9, 0xA
-
-    def __init__(self, host, port=WSS_PORT, timeout=10):
-        import base64
-        import hashlib
-        import os as _os
-
-        ctx = ssl.create_default_context()
-        raw = socket.create_connection((host, port), timeout=timeout)
-        self.sock = ctx.wrap_socket(raw, server_hostname=host)
-        key = base64.b64encode(_os.urandom(16)).decode()
-        req = (f"GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-               f"Sec-WebSocket-Version: 13\r\nOrigin: https://twitch.tv\r\n\r\n")
-        self.sock.sendall(req.encode())
-        # читаем заголовок handshake по байтово (он маленький)
-        hdr = b""
-        while not hdr.endswith(b"\r\n\r\n"):
-            b = self.sock.recv(1)
-            if not b:
-                raise ConnectionError("handshake: сервер закрыл соединение")
-            hdr += b
-        expect = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-        status = hdr.split(b"\r\n", 1)[0].decode(errors="replace")
-        low = hdr.lower()
-        if b"101" not in status.encode() or expect.encode().lower() not in low:
-            raise ConnectionError(f"handshake отклонён: {status!r}")
-        self._rxbuf = b""       # сырые байты из сокета
-        self._payload = b""     # собранный незавершённого фрагмента
-        self._frag_op = None
-        self.closed = False
-
-    # --- низкоуровневое чтение кадров ---
-    def _read_exact(self, n, deadline):
-        while len(self._rxbuf) < n:
-            remaining = deadline - now()
-            if remaining <= 0:
-                raise socket.timeout()
-            self.sock.settimeout(min(remaining, 1.0))
-            try:
-                chunk = self.sock.recv(65536)
-            except (socket.timeout, TimeoutError):
-                if now() >= deadline:
-                    raise
-                continue
-            if not chunk:
-                raise ConnectionError("сервер закрыл соединение (0 байт)")
-            self._rxbuf += chunk
-        out, self._rxbuf = self._rxbuf[:n], self._rxbuf[n:]
-        return out
-
-    def _send_frame(self, opcode, payload=b""):
-        import os as _os
-        mask = _os.urandom(4)
-        n = len(payload)
-        head = bytes([0x80 | opcode])
-        if n < 126:
-            head += bytes([0x80 | n])
-        elif n < 65536:
-            head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
-        else:
-            head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self.sock.sendall(head + mask + masked)
-
-    def _next_message(self, deadline):
-        """Возвращает следующий текстовый кадр (bytes); служебные кадры обрабатывает сама."""
-        while True:
-            b0, b1 = self._read_exact(2, deadline)
-            fin = b0 & 0x80
-            op = b0 & 0x0F
-            ln = b1 & 0x7F
-            if ln == 126:
-                ln = int.from_bytes(self._read_exact(2, deadline), "big")
-            elif ln == 127:
-                ln = int.from_bytes(self._read_exact(8, deadline), "big")
-            payload = self._read_exact(ln, deadline) if ln else b""
-            if op == self.OPCODES_PING:
-                self._send_frame(self.OPCODES_PONG, payload)
-                continue
-            if op == self.OPCODES_PONG:
-                continue
-            if op == self.OPCODES_CLOSE:
-                self.closed = True
-                raise ConnectionError("сервер прислал WS CLOSE")
-            if op in (self.OPCODES_TEXT, self.OPCODES_BIN):
-                if fin:
-                    return payload
-                self._payload = payload
-                self._frag_op = op
-                continue
-            if op == self.OPCODES_CONT:
-                self._payload += payload
-                if fin:
-                    out, self._payload = self._payload, b""
-                    return out
-                continue
-
-    def send(self, text):
-        self._send_frame(self.OPCODES_TEXT, text.encode("utf-8", "replace"))
-
-    def recv_lines(self, timeout=READ_TIMEOUT):
-        """Как у Conn: возвращает ВСЕ готовые строки до истечения timeout."""
-        deadline = now() + timeout
-        lines = []
-        while True:
-            remaining = deadline - now()
-            if remaining <= 0:
-                return lines
-            try:
-                chunk = self._next_message(deadline)
-            except (socket.timeout, TimeoutError):
-                return lines
-            except OSError as e:
-                raise ConnectionError(f"ws recv: {type(e).__name__}: {e}")
-            self._payload_buf = getattr(self, "_payload_buf", b"") + chunk
-            while b"\r\n" in self._payload_buf:
-                raw, _, self._payload_buf = self._payload_buf.partition(b"\r\n")
-                if raw:
-                    lines.append(raw.decode("utf-8", "replace"))
-
-    def close(self):
-        try:
-            self._send_frame(self.OPCODES_CLOSE)
-        except Exception:
-            pass
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-
-
 class Conn:
-    """Обёртка: либо голый TCP-сокет, либо WssClient (WebSocket без внешних зависимостей)."""
+    """Обёртка: либо голый TCP-сокет, либо WebSocket-клиент."""
 
     def __init__(self, sock=None, ws=None, label=""):
         self.sock = sock
@@ -231,16 +91,16 @@ class Conn:
         self.buf = b""
 
     def send(self, data):
+        b = data.encode("utf-8", "replace")
         if self.sock is not None:
-            self.sock.sendall(data.encode("utf-8", "replace"))
+            self.sock.sendall(b)
         else:
-            self.ws.send(data)
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(self.ws.send(data))
 
     def recv_lines(self, timeout=READ_TIMEOUT):
         """Читает ВЕСЬ доступный трафик до таймаута (как исправленный dogs_chat).
         Возвращает список строк; пустой список = тишина timeout секунд."""
-        if self.ws is not None:
-            return self.ws.recv_lines(timeout)
         deadline = now() + timeout
         lines = []
         while True:
@@ -248,8 +108,15 @@ class Conn:
             if remaining <= 0:
                 return lines
             try:
-                self.sock.settimeout(remaining)
-                chunk = self.sock.recv(65536)
+                if self.sock is not None:
+                    self.sock.settimeout(remaining)
+                    chunk = self.sock.recv(65536)
+                else:
+                    import asyncio
+                    loop = asyncio.get_event_loop()
+                    chunk_raw = loop.run_until_complete(
+                        asyncio.wait_for(self.ws.recv(), timeout=remaining))
+                    chunk = chunk_raw.encode("utf-8", "ignore") if isinstance(chunk_raw, str) else chunk_raw
             except (socket.timeout, TimeoutError):
                 return lines
             except OSError as e:
@@ -293,11 +160,16 @@ def step_tcp():
 def step_wss():
     log(f"== ШАГ 2b: TLS/WSS к {WSS_HOST}:{WSS_PORT} ==")
     try:
+        import websockets  # noqa: F401
+    except ImportError:
+        log("SKIP: пакет `websockets` не установлен (pip install websockets). Это нормально для TCP-режима.")
+        return None
+    try:
         ctx = ssl.create_default_context()
         s = socket.create_connection((WSS_HOST, WSS_PORT), timeout=10)
         tls = ctx.wrap_socket(s, server_hostname=WSS_HOST)
         tls.close()
-        log("OK: TLS-handshake на 443 прошёл (websockets-пакет НЕ нужен)")
+        log("OK: TLS-handshake на 443 прошёл")
         return True
     except OSError as e:
         log(f"FAIL: {type(e).__name__}: {e}")
@@ -449,14 +321,18 @@ def main():
     exit_code = 0
     try:
         if args.wss:
-            ws = WssClient(WSS_HOST, WSS_PORT)
+            import asyncio
+            import websockets
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            ws = loop.run_until_complete(websockets.connect(f"wss://{WSS_HOST}:{WSS_PORT}"))
             conn = Conn(ws=ws, label="WSS 443")
-            log("Подключено через WebSocket 443 (чистый Python, без pip-пакетов)")
+            log("Подключено через WebSocket 443")
         else:
             s = socket.create_connection((IRC_HOST, IRC_PORT), timeout=10)
             conn = Conn(sock=s, label="TCP 6667")
             log("Подключено через TCP 6667")
-    except (OSError, ConnectionError) as e:
+    except OSError as e:
         log(f"FAIL: не удалось подключиться: {type(e).__name__}: {e}")
         return 2
 
@@ -468,7 +344,8 @@ def main():
             if conn.sock is not None:
                 conn.sock.close()
             elif conn.ws is not None:
-                conn.ws.close()
+                import asyncio
+                asyncio.get_event_loop().run_until_complete(conn.ws.close())
         except Exception:
             pass
 
