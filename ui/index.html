@@ -7,25 +7,25 @@
 </head>
 <body>
   <div id="scene">
-    <!-- газон, по которому собаки бродят у нижнего края экрана -->
-    <div id="lawn"></div>
+    <!-- будка справа (картинка из ui/assets/kennel.png, до неё — заглушка);
+         на крыше сидят собаки-модераторы -->
+    <div id="kennel"><div id="mod-roost"><!-- модераторы на крыше --></div></div>
 
-    <!-- будка справа: из неё собаки выходят на выгул, модераторы сидят на крыше -->
-    <div id="kennel">
-      <div class="roof"><span class="chimney"></span><span class="sign">МОДЕРАТОРЫ</span></div>
-      <div class="body">
-        <div class="door"></div>
-      </div>
-      <div id="mod-roost"><!-- собаки-модераторы на крыше --></div>
-    </div>
-
+    <!-- зона выгула: собаки ходят ТОЛЬКО влево-вправо по нижнему краю экрана -->
     <div id="yard"><!-- бродячие собаки-чатеры --></div>
 
-    <div id="header">
-      <span class="paw">🐾</span>
-      <span id="counter">0 активных</span>
+    <!-- служебные pre-load картинки для определения naturalWidth/Height PNG -->
+    <div id="metrics" aria-hidden="true"></div>
+
+    <!-- тестовая панель: НЕ видна в OBS (body.obs), только в браузере.
+         Позволяет рисовать и проверять ассеты без Twitch -->
+    <div id="testbar">
+      <button id="t-add">+ собака</button>
+      <button id="t-remove">− собака</button>
+      <button id="t-mod">🛡️ модератор</button>
+      <button id="t-assets">🔄 перезагрузить ассеты</button>
+      <span id="assets-info">заглушки</span>
     </div>
-    <div id="status">подключение…</div>
   </div>
   <script src="/static/dogs.js"></script>
 </body>

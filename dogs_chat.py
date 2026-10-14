@@ -397,6 +397,39 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json; charset=utf-8", body)
         elif path == "/favicon.ico":
             self._send(204, "image/x-icon", b"")
+        elif path.startswith("/assets/"):
+            # пользовательские ассеты из ui/assets (PNG-собаки, будка и т.п.)
+            name = os.path.basename(path)  # защита от path traversal
+            f = UI_DIR / "assets" / name
+            if f.exists() and f.is_file():
+                self._send(200, "image/png", f.read_bytes(),
+                           extra={"Cache-Control": "no-cache"})
+            else:
+                self._send(404, "text/plain", b"asset not found")
+        elif path == "/api/assets":
+            # список доступных картинок + длительность кадра — клиент сам
+            # решает, что уже нарисовано, а что пока показывать заглушкой
+            adir = UI_DIR / "assets"
+            files = []
+            if adir.is_dir():
+                try:
+                    files = sorted(os.listdir(adir))
+                except OSError:
+                    files = []
+            frame_ms = 250
+            durfile = adir / "frame-duration.txt"
+            if durfile.is_file():
+                try:
+                    txt = durfile.read_text(encoding="utf-8-sig")
+                    num = "".join(ch for ch in txt.split("#")[0] if ch.isdigit())
+                    if num:
+                        frame_ms = max(40, min(3000, int(num)))
+                except Exception:
+                    pass
+            data = {"files": files, "frame_duration_ms": frame_ms}
+            body = json.dumps(data).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body,
+                       extra={"Cache-Control": "no-store"})
         else:
             self._send(404, "text/plain", b"not found")
 
