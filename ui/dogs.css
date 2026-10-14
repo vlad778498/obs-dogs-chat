@@ -5,8 +5,15 @@
  * показывается временная заглушка-эмодзи. */
 :root {
   --text: #f2f4fa;
-  --dog-size: 110px;          /* высота собаки на экране (подгоняется под PNG) */
-  --kennel-w: 170px;          /* ширина будки на экране */
+  /* Высота СОБАКИ на экране в пикселях. Ширина считается сама из
+     пропорций PNG (aspect-ratio), поэтому картинку не сплющивает.
+     Пример: dog.png 200x100 при --dog-size:90px => на экране 180x90. */
+  --dog-size: 90px;
+  /* Высота БУДКИ на экране в пикселях (не ширина!). Ширина — тоже из
+     пропорций kennel.png. Пример: kennel.png 300x200 при 150px => 225x150,
+     т.е. будка будет в ~1.7 раза выше собаки.
+     Ориентиры: 120px ≈ 1.3 собачьих роста, 150px ≈ 1.7, 180px ≈ 2. */
+  --kennel-h: 150px;
   --ground: 0px;              /* смещение "пола" вверх от нижнего края */
 }
 
@@ -22,10 +29,13 @@ html, body {
 
 #scene { position: relative; width: 100vw; height: 100vh; }
 
-/* --- будка справа ------------------------------------------------------------ */
+/* === будка справа ===========================================================
+ * БУДКА. Привязана к нижнему краю (bottom) и к правому (right).
+ * Размер задаётся ВЫСОТОЙ --kennel-h, ширина вычисляется из пропорций
+ * PNG (--kennel-ar подставляет JS после загрузки kennel.png). */
 #kennel {
   position: absolute; right: 16px; bottom: var(--ground);
-  width: var(--kennel-w); height: auto; aspect-ratio: var(--kennel-ar, 1);
+  height: var(--kennel-h); width: auto; aspect-ratio: var(--kennel-ar, 1.5);
   z-index: 5; pointer-events: none;
 }
 /* CSS-заглушка будки, пока kennel.png не нарисован */
@@ -50,10 +60,13 @@ html, body {
   background: #241610; border-radius: 50% 50% 0 0 / 34% 34% 0 0;
   box-shadow: inset 0 0 14px rgba(0,0,0,.9);
 }
-/* готовая картинка будки */
-#kennel.has-art { background: url("/assets/kennel.png") bottom center / 100% auto no-repeat; }
+/* готовая картинка будки: тянем на всю ширину блока (ширина = высота*пропорции PNG) */
+#kennel.has-art { background: url("/assets/kennel.png") bottom center / 100% 100% no-repeat; }
 
 /* --- модераторы на крыше ------------------------------------------------------ */
+/* Модераторы сидят НА КРЫШЕ будки.
+ * --roof-overlap: насколько лапы «втапливаются» в крышу (уменьшите, если
+ * модераторы висят над крышей; увеличьте, если проваливаются внутрь будки). */
 #mod-roost {
   position: absolute; left: 0; right: 0;
   bottom: calc(100% - var(--roof-overlap, 10px)); /* встают "на крышу" */
@@ -85,6 +98,8 @@ html, body {
 }
 
 .dog {
+  /* СОБАКА на сцене. position/left задаёт JS (анимация ходьбы).
+   * height = --dog-size, ширина = высота * пропорции PNG (--sprite-ar). */
   position: absolute; bottom: 0;               /* пол фиксирован — только left меняется */
   height: var(--dog-size); aspect-ratio: var(--sprite-ar, 1);
   overflow: visible;                           /* ник под собакой не обрезается */
@@ -115,6 +130,11 @@ html, body {
 /* подпись — ТОЛЬКО ник, без обводок/плашек.
  * ВАЖНО: подпись лежит ВНУТРИ карточки собаки (.dog имеет overflow:visible),
  * поэтому не обрезается ни зоной выгула, ни краем экрана. */
+/* НИК чатера — над головой собаки.
+ * top: -13px  — зазор над спрайтом (увеличьте по модулю, если ник залезает
+ *                на уши/голову вашей картинки, например -18px);
+ * font-size   — размер ника (учитывайте масштаб Browser Source в OBS!);
+ * text-shadow — читаемость на любом фоне (обводок нет, только тень). */
 .name {
   position: absolute; top: -13px; left: 50%; transform: translate(-50%, -2px);
   font-size: 12px; font-weight: 700; color: #ffffff;

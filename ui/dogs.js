@@ -16,7 +16,7 @@
  *     используется безымянный файл (старая двухкадровая схема);
  *   - ориентация: файлы с суффиксом -right/-left используются как есть,
  *     если left-версии нет — right-спрайт зеркалится CSS-ом;
- *   - размеры на экране задаются в CSS (--dog-size, --kennel-w),
+ *   - размеры на экране задаются в CSS (--dog-size — высота собаки, --kennel-h — высота будки),
  *     пропорции PNG подхватываются автоматически.
  */
 (function () {
@@ -42,6 +42,7 @@
     kennelArt: false,        // есть ли kennel.png
     runArt: false,           // отдельный кадр бега (опционально)
     ratio: 1,                // ширина/высота спрайта собаки (из PNG)
+    kennelRatio: 1.5,        // ширина/высота kennel.png (замер JS)
     _list: [],               // отсортированный список файлов (для поиска кадров)
     _frameCache: new Map(),  // "breed|pose|dir" -> массив URL кадров
     drawnBreeds: new Set(),  // породы, для которых в assets есть свои PNG
@@ -168,6 +169,7 @@
         document.documentElement.style.setProperty("--sprite-ar", this.ratio.toFixed(4));
       });
       measureSprite("kennel.png", (w, h) => {
+        this.kennelRatio = w / h;   // ширина будки на экране = --kennel-h * kennelRatio
         document.documentElement.style.setProperty("--kennel-ar", (w / h).toFixed(4));
       });
       // обновляем уже стоящих на сцене собак/модераторов
@@ -380,9 +382,10 @@
   function rand(a, b) { return a + Math.random() * (b - a); }
 
   function spawnX() {
-    // выходим из будки: правый край экрана минус ширина будки
-    const kw = parseFloat(getComputedStyle(document.documentElement)
-      .getPropertyValue("--kennel-w")) || 170;
+    // выходим из будки: ширина будки = её высота * пропорции PNG (замер JS)
+    const kh = parseFloat(getComputedStyle(document.documentElement)
+      .getPropertyValue("--kennel-h")) || 150;
+    const kw = Math.round(kh * (Assets.kennelRatio || 1.5));
     return areaW() - kw - rand(0, 40);
   }
 
