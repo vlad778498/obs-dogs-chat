@@ -361,6 +361,9 @@ class TwitchChatThread(threading.Thread):
         self.my_pongs = 0              # сколько раз мы ответили PONG на PING сервера
         self.server_pings = 0          # сколько PING прислал сервер
         self.last_privmsg_line = ""    # последняя полная строка PRIVMSG (для лога)
+        self.irc_cmds_seen = {}        # счётчик всех IRC-команд от сервера за соединение
+                                       # (JOIN/PART/NAMES/353/NOTICE/PRIVMSG...) — по нему
+                                       # видно, жив ли канал и что именно шлёт Twitch
 
     def run(self):
         channels = [c.strip().lstrip("#").lower() for c in self.config.get("channels", []) if c.strip()]
@@ -461,6 +464,12 @@ class TwitchChatThread(threading.Thread):
             + ("ВЫВОД: Twitch НЕ присылает нам трафик (см. [msg]/[diag]) — причина вне нашего кода."
                if self.rx_last_ts is None or now - self.rx_last_ts > 60
                else "ВЫВОД: пакеты от Twitch приходят — если чатеров нет, значит в чате тихо или теряются PRIVMSG."))
+        # какие команды вообще приходили от сервера за это соединение. Если тут
+        # есть JOIN/PART/NAMES/353, но нет PRIVMSG — канал жив и Twitch реально
+        # не шлёт сообщения чата (типично для анонимного justinfan-подключения).
+        cmds = ", ".join(f"{k}:{v}" for k, v in sorted(self.irc_cmds_seen.items(),
+                                                       key=lambda kv: -kv[1])[:12]) or "-"
+        log(f"[cmds] Команды от сервера за соединение #{self.conn_id}: {cmds}")
 
     def _connect_and_read(self, nick: str, channels: list):
         conn = self._open_conn()
@@ -492,9 +501,12 @@ class TwitchChatThread(threading.Thread):
             self.rx_last_ts = None
             self.server_pings = 0
             self.my_pongs = 0
+            self.irc_cmds_seen = {}
             self._log_alive(force=True)   # сразу при подключении — видно, что всё поднялось
             got_msgs = 0
             last_keepalive = time.time()
+            last_rx_wall = time.time()      # когда был ЛЮБОЙ входящий байт (wall clock)
+            idle_logged_60 = False          # чтобы [stall] не повторялся каждую секунду
             while not self.stop_event.is_set():
                 self._log_alive()          # раз в 2 минуты строчка [alive] в journal
                 try:
@@ -508,7 +520,26 @@ class TwitchChatThread(threading.Thread):
                     log(f"[irc] Соединение потеряно: {type(e).__name__}: {e}. Переподключение...")
                     break
                 if msg is None:
-                    if time.time() - last_keepalive > 25:
+                    now_w = time.time()
+                    # --- принудительная ротация соединения при «тишине» ---
+                    # Если ЦЕЛЫХ 90 секунд от Twitch не пришло НИ ОДНОГО байта
+                    # (даже PING/NAMES — т.е. сервер перестал слать нам трафик,
+                    # что бывает с анонимными justinfan-подключениями), то
+                    # переподключение само по себе ничего не даст — но новый
+                    # TCP-коннект с новым ephemeral портом часто «сбрасывает»
+                    # состояние троттлинга на стороне Twitch/CDN. Поэтому рвём
+                    # и поднимаем заново, а не ждём вечно.
+                    if now_w - last_rx_wall > 90:
+                        log(f"[irc] 90 c полного молчания от сервера — переподключение "
+                            f"(принудительная ротация TCP-сессии).")
+                        break
+                    if now_w - last_rx_wall > 60 and not idle_logged_60:
+                        idle_logged_60 = True
+                        cmds = ", ".join(f"{k}:{v}" for k, v in sorted(
+                            self.irc_cmds_seen.items(), key=lambda kv: -kv[1])[:12]) or "-"
+                        log(f"[stall] ВНИМАНИЕ: 60+ c нет НИ ОДНОГО пакета от Twitch. "
+                            f"Команды за соединение были: {cmds}")
+                    if now_w - last_keepalive > 25:
                         # Активный keep-alive. Раньше тут был повторный JOIN
                         # («already in channel» безвреден) — но многие NAT/файрволы
                         # НЕ считают IRC-трафик «активным», если это не PING/PONG
@@ -519,7 +550,10 @@ class TwitchChatThread(threading.Thread):
                         try:
                             send("PING :dogs-chat")
                             for ch in channels:
-                                send(f"JOIN #{ch}")
+                                send(f"JOIN #{ch}")   # повторный JOIN + запрос NAMES
+                                                     # обновляет счётчик irc_cmds_seen
+                                                     # (сервер отвечает 353/366) — видно,
+                                                     # жив ли канал даже при тишине чата
                         except Exception:
                             raise  # сокет уже мёртв — наверх, переподключение
                         last_keepalive = time.time()
@@ -528,8 +562,12 @@ class TwitchChatThread(threading.Thread):
                     msg = msg.decode("utf-8", "replace")
                 # УЧЁТ ЛЮБОГО входящего пакета — ключевая диагностика: позволяет
                 # отличить «Twitch молчит» от «мы потеряли сообщения».
+                had_traffic = bool(msg.strip()) if isinstance(msg, str) else bool(msg)
                 self.rx_bytes += len(msg)
                 self.rx_last_ts = time.time()
+                if had_traffic:
+                    last_rx_wall = time.time()
+                    idle_logged_60 = False
                 # PING от сервера может прийти в любом сообщении — отвечаем сразу,
                 # иначе Twitch закрывает молчаливое соединение (~через минуту)
                 if "PING" in msg:
@@ -553,6 +591,8 @@ class TwitchChatThread(threading.Thread):
                     if not parsed:
                         continue
                     nick_user, tags, cmd, params, trailing = parsed
+                    # учёт ВСЕХ команд от сервера — для [cmds] в диагностике
+                    self.irc_cmds_seen[cmd] = self.irc_cmds_seen.get(cmd, 0) + 1
                     if cmd == "PRIVMSG" and nick_user:
                         # игнорируем ботов/сервера, если вдруг
                         login = tags.get("login", nick_user.lower())
