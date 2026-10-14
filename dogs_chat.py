@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from pathlib import Path
 
 try:
@@ -319,10 +319,35 @@ ActivityStore._seed = _seed
 # ---------------------------------------------------------------------------
 # HTTP-сервер: отдаёт HTML и JSON/SSE для Browser Source
 # ---------------------------------------------------------------------------
+class QuietHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer, который не печатает стектрейсы при обрыве соединения.
+
+    OBS (и любой браузер) часто закрывает SSE-соединения или страницы без
+    корректного завершения — это нормальное событие сети (ConnectionResetError /
+    BrokenPipeError), а не ошибка плагина. По умолчанию socketserver вызывает
+    handle_error() и льёт traceback в journalctl; мы глушим именно эти ошибки.
+    """
+    daemon_threads = True            # потоки не мешают остановке сервиса по Ctrl+C/systemd
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return                   # клиент оборвал соединение — тихо игнорируем
+        super().handle_error(request, client_address)  # прочие ошибки — как обычно, в лог
+
+
 class Handler(BaseHTTPRequestHandler):
     store: ActivityStore = None      # внедряется ниже
     config: dict = None
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self):
+        """Не падать с traceback, если клиент оборвал соединение до/во время запроса."""
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            self.close_connection = True
 
     def log_message(self, fmt, *args):
         pass  # тишина
@@ -477,7 +502,7 @@ def main():
     Handler.store = store
     Handler.config = config
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = QuietHTTPServer((host, port), Handler)
     print("=" * 60)
     shown_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host
     print(f"  Собаки чата запущены:  http://{shown_host}:{port}")
