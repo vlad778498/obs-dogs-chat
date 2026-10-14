@@ -32,6 +32,31 @@
   if (/obs/i.test(navigator.userAgent)) document.body.classList.add("obs");
 
   // =========================================================================
+  // Индикатор живости (только вне OBS). Исторический баг «собаки появляются
+  // лишь минуту, потом молчат» почти всегда был не в IRC, а в мёртвом SSE:
+  // браузер/OBS показывал последний снимок. Теперь прямо на странице видно,
+  // когда последний раз пришли ДАННЫЕ: зелёная точка = данные идут, красная =
+  // соединения нет/данные не обновляются. В OBS-источнике индикатор скрыт.
+  // =========================================================================
+  let liveDot = null;
+  try {
+    liveDot = document.createElement("div");
+    liveDot.id = "live-dot";
+    liveDot.title = "Индикатор получения данных с сервера";
+    Object.assign(liveDot.style, {
+      position: "fixed", top: "8px", left: "8px", width: "14px", height: "14px",
+      borderRadius: "50%", background: "#e33", zIndex: "9999",
+      boxShadow: "0 0 6px rgba(0,0,0,.5)", transition: "background .3s",
+    });
+    document.body.appendChild(liveDot);
+    function setLive(ok) {
+      if (!liveDot || document.body.classList.contains("obs")) return;
+      liveDot.style.background = ok ? "#2ecc40" : "#e33";
+    }
+    window.__setDogsLive = setLive;
+  } catch (e) { /* украшение — не критично */ }
+
+  // =========================================================================
   // Реестр ассетов: что уже нарисовано
   // =========================================================================
   const Assets = {
@@ -638,13 +663,20 @@
       sseBroken = false;
       warnedStall = false;
       stopPolling();
+      if (window.__setDogsLive) window.__setDogsLive(true);
       try { render(JSON.parse(ev.data)); } catch (e) { /* ignore */ }
     };
     es.onerror = () => { /* браузер сам переподключится; страховка ниже */ };
   } catch (e) { sseBroken = true; }
 
   function pollOnce() {
-    fetch("/api/dogs").then((r) => r.json()).then(render).catch(() => {});
+    fetch("/api/dogs", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d) => {
+        if (window.__setDogsLive) window.__setDogsLive(true);
+        render(d);
+      })
+      .catch(() => {});
   }
   function startPolling() {
     if (pollTimer) return;
@@ -664,6 +696,10 @@
   const POLL_MS = 3000;       // частота страховочного опроса
   setInterval(() => {
     if (performance.now() - lastMsgAt > SSE_STALL_MS || sseBroken) startPolling();
+    // Индикатор: данные не обновлялись дольше 20 c — точка краснеет.
+    if (window.__setDogsLive && performance.now() - lastMsgAt > 20000) {
+      window.__setDogsLive(false);
+    }
   }, 2000);
   setTimeout(pollOnce, 1500); // первый снимок получим сразу, не дожидаясь SSE
 

@@ -554,7 +554,23 @@ class TwitchChatThread(threading.Thread):
             + ("ВЫВОД: Twitch НЕ присылает нам трафик (см. [msg]/[diag]) — причина вне нашего кода."
                if self.rx_last_ts is None or now - self.rx_last_ts > 60
                else "ВЫВОД: пакеты от Twitch приходят — если чатеров нет, значит в чате тихо или теряются PRIVMSG.")
-            + f" Буфер сокета: {self._rx_buf} байт непереведённых строк; всего переподключений: {self.conn_id}.")
+            + (f" Буфер сокета: {self._rx_buf} байт непереведённых строк; "
+               f"всего переподключений: {self.conn_id}."))
+        # --- канал до браузера OBS (SSE). Если [msg] идут, а собаки нет —
+        # причина здесь: sse_clients=0 значит браузер НЕ держит /api/stream
+        # (URL источника/перезагрузка страницы), last push давно -> поток умер.
+        # Handler определён ниже в этом же модуле — берём из глобального
+        # словаря на момент вызова (импорт self-модуля недопустим: сервис
+        # запускается как __main__).
+        _H = globals().get("Handler")
+        if _H is None:
+            return
+        since_push = "никогда" if _H.last_sse_push is None else f"{int(now - _H.last_sse_push)} c назад"
+        log(f"[ui] SSE-клиентов: {_H.sse_clients}; последний снимок браузеру: {since_push}"
+            + (" — ВНИМАНИЕ: ни одного подключённого клиента /api/stream! "
+               "Сообщения до сервера доходят, но OBS их не запрашивает: "
+               "проверьте URL browser source и перезагрузите источник."
+               if _H.sse_clients == 0 and self.msgs_this_conn > 0 else ""))
         # какие команды вообще приходили от сервера за это соединение. Если тут
         # есть JOIN/PART/NAMES/353, но нет PRIVMSG — канал жив и Twitch реально
         # не шлёт сообщения чата (типично для анонимного justinfan-подключения).
@@ -890,6 +906,12 @@ class Handler(BaseHTTPRequestHandler):
     store: ActivityStore = None      # внедряется ниже
     config: dict = None
     protocol_version = "HTTP/1.1"
+    # --- диагностика UI-канала (SSE): «IRC молотит, а собаки не появляются»
+    # раньше нельзя было отличить от «браузер OBS потерял соединение». Теперь
+    # видно: сколько клиентов /api/stream подключено прямо сейчас и когда был
+    # последний УСПЕШНЫЙ снимок, отданный браузеру. Пишется в [diag] потока IRC.
+    sse_clients = 0
+    last_sse_push = None
 
     def handle_one_request(self):
         """Не падать с traceback, если клиент оборвал соединение до/во время запроса."""
@@ -906,6 +928,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        # КРИТИЧНО для OBS BrowserSource: без no-cache CEF/Chromium отдаёт
+        # index.html и dogs.js из HTTP-кэша. После любой правки UI браузер
+        # в OBS продолжает крутить СТАРУЮ версию скрипта — все фиксы «не
+        # работают» даже после git pull и systemctl restart. Раньше кэш был
+        # только у /assets/*, из-за чего и рождалась легенда «собаки
+        # появляются лишь минуту».
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         if extra:
             for k, v in extra.items():
                 self.send_header(k, v)
@@ -938,6 +967,7 @@ class Handler(BaseHTTPRequestHandler):
             interval = max(1, int(self.config.get("refresh_ui_seconds", 5)))
             window = self.config.get("active_window_seconds", 3600)
             start = time.monotonic()
+            Handler.sse_clients += 1
             try:
                 while time.monotonic() - start < max_life:
                     dogs = self.store.active_users()
@@ -950,9 +980,13 @@ class Handler(BaseHTTPRequestHandler):
                     payload = f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
                     self.wfile.write(payload.encode("utf-8"))
                     self.wfile.flush()
+                    # снимок РЕАЛЬНО отправлен браузеру — фиксируем для [diag]
+                    Handler.last_sse_push = time.time()
                     time.sleep(interval)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass  # клиент ушёл — штатно
+            finally:
+                Handler.sse_clients -= 1
             return
 
         if path == "/" or path == "/index.html":
