@@ -30,6 +30,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -1447,6 +1448,37 @@ DEFAULT_DISPLAY_CONFIG = {
 _display_cache = {"mtime": None, "cfg": None}
 
 
+def _json_lenient(text: str):
+    """json.loads с прощением типичных ручных правок JSON.
+
+    Люди часто редактируют display.json как обычный конфиг: оставляют
+    висячую запятую перед } или ], пишут //комментарии, используют
+    кавычки-«ёлочки» вместо ". Строгий json.loads на такое падает, и
+    настройки «перестают применяться». Пробуем строгий вариант, затем
+    чиним известные мелочи. Если не помогло — исключение как раньше
+    (в логах появится понятная строка ВНИМАНИЕ).
+    """
+    try:
+        return json.loads(text)
+    except Exception as first_err:
+        fixed = text
+        # ёлочки/лапки -> обычные кавычки (только вне корректного JSON они и мешают)
+        for a, b in (("“", '"'), ("”", '"'), ("«", '"'), ("»", '"')):
+            fixed = fixed.replace(a, b)
+        # // комментарии до конца строки
+        fixed = re.sub(r"(?m)//[^\n]*$", "", fixed)
+        # висячие запятые перед закрывающим ] или }
+        fixed = re.sub(r",(\s*[}\]])", r"\1", fixed)
+        try:
+            res = json.loads(fixed)
+        except Exception:
+            raise first_err
+        log("[config] display.json содержал неточный синтаксис "
+            "(висячая запятая/комментарий/«ёлочки») — исправлено автоматически. "
+            "На будущее: JSON требует строгого синтаксиса.")
+        return res
+
+
 def load_display_config() -> dict:
     base = dict(DEFAULT_DISPLAY_CONFIG)
     try:
@@ -1460,16 +1492,18 @@ def load_display_config() -> dict:
         log(f"[config] Создан конфиг отображения: {DISPLAY_CONFIG_PATH}")
         return dict(base)
     mtime = st.st_mtime
-    if _display_cache["cfg"] is not None and mtime == _display_cache["mtime"]:
+    size = st.st_size
+    stamp = (mtime, size)
+    if _display_cache["cfg"] is not None and stamp == _display_cache["mtime"]:
         return dict(_display_cache["cfg"])          # файл не менялся — отдаём кэш
     try:
         text = DISPLAY_CONFIG_PATH.read_text(encoding="utf-8-sig")
-        user_cfg = json.loads(text)
+        user_cfg = _json_lenient(text)
         if not isinstance(user_cfg, dict):
             raise ValueError("корень JSON должен быть объектом {...}")
         merged = dict(base)
         merged.update(user_cfg)
-        _display_cache["mtime"] = mtime
+        _display_cache["mtime"] = stamp
         _display_cache["cfg"] = merged
         log(f"[config] display.json перечитан ({len(user_cfg)} ключей пользователя)")
         return dict(merged)
