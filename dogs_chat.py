@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
     "max_dogs": 60,                    # максимум собак на экране
     "nickname": "",                    # ник для IRC (пусто = justinfan random)
     "oauth_token": "",                 # опционально: oauth:... токен чата (для привилегированного чтения)
+    "irc_prefer_auth": False,          # false (по умолчанию): читать чат АНОНИМНО (justinfan*) —
+                                       # стабильнее; true: использовать oauth_token/nickname
     "irc_transport": "",               # ""/auto = wss 443 (основной) + tcp 6667 (резерв); "tcp"/"ws" — только один из них
     "http_port": 8377,
     "http_host": "127.0.0.1",          # 0.0.0.0 — если сервер на ВМ, а OBS на другой машине
@@ -183,42 +185,48 @@ class RawWSClient:
                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
         self.sock.settimeout(self.timeout)
         self.sock.sendall(req.encode())
-        resp = b""
-        while b"\r\n\r\n" not in resp:
-            chunk = self.sock.recv(4096)
-            if not chunk:
+        # Читаем ответ handshake ПО БАЙТОВО (как в проверенном тесте
+        # tests/twitch_connect_test.py, который держит WS 443 стабильно).
+        # Прежний вариант «recv(4096) до \r\n\r\n» заглатывал из TLS-потока
+        # ВСЁ, что успело прийти, вместе с первыми IRC-данными, а затем
+        # терял лишнее: остаток бросался, и следующий кадр читался из
+        # смещённого потока -> сервер «закрывал соединение (0 байт)».
+        hdr = b""
+        while not hdr.endswith(b"\r\n\r\n"):
+            b = self.sock.recv(1)
+            if not b:
                 raise ConnectionError("WS handshake: сервер закрыл соединение на handshake")
-            resp += chunk
-        head, rest = resp.split(b"\r\n\r\n", 1)
-        status = head.split(b"\r\n", 1)[0].decode(errors="replace")
-        if "101" not in status:
-            snippet = head.decode(errors="replace")[:300].replace("\r\n", " | ")
-            raise ConnectionError(f"WS handshake failed: {status} :: {snippet}")
+            hdr += b
+        status = hdr.split(b"\r\n", 1)[0].decode(errors="replace")
         expect = base64.b64encode(hashlib.sha1(
             (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-        if expect.lower().encode() not in head.lower():
-            raise ConnectionError(f"WS handshake: неверный Sec-WebSocket-Accept в {status!r}")
-        self.buf = rest
+        low = hdr.lower()
+        if "101" not in status or expect.lower().encode() not in low:
+            snippet = status[:200].replace("\r\n", " | ")
+            raise ConnectionError(f"WS handshake failed: {snippet!r}")
+        # После побайтового чтения заголовка в буфере гарантированно НОЛЬ
+        # байт — поток кадров начинается ровно после \r\n\r\n.
+        self.buf = b""
         self.sock.settimeout(None)   # таймауты чтения управляются внутри recv()
         return self
 
     def connect(self):
-        """Handshake с ретраями и экспоненциальной задержкой (2, 4, 8 c).
+        """Handshake с ретраями и растущей задержкой (0.5, 1, 2 c).
 
-        Живые логи 14–15.10 показали два режима отказов:
-          * единичные сетевые сбои — лечатся простым повтором;
-          * «сервер закрыл соединение (0 байт)» СРАЗУ после успешного
-            connect(), волнами по нескольку минут подряд (типично для
-            временного баня IP у edge-ноды Twitch или реза провайдером).
-        Одна ретрай-попытка тут не помогала: мы долбили тот же endpoint раз
-        в 5-6 секунд, что лишь продлевало бан. Теперь до 4 попыток с
-        нарастающей паузой; между ними TCP+TLS пересоздаются заново, key —
-        новый. Если все попытки неудачны — исключение наверх, где поток
-        спит 5 c и пробует снова (плюс откат на TCP 6667 после 2 волн).
+        ВАЖНО — почему паузы МЕЖДУ попытками такие короткие: Twitch ограничивает
+        частоту WS-handshake'ов с одного IP. Старая схема (до 4 попыток с
+        паузами 2/4/8 c плюс внешний цикл ещё и спал 5 c между коннектами)
+        давала ~1 попытку каждые 10-20 c НОН-СТОП — Twitch начинал молча
+        обрывать соединения сразу после handshake («сервер закрыл соединение
+        (0 байт)») и банл IP глубже. Логи 15.10 это ровно показывали.
+        Новая схема: быстрый ретрай внутри connect (обычно 1-2 попытки
+        достаточно при единичном сетевом сбое), а внешнему циклу сообщаем
+        через атрибут `retry_hint`, сколько ещё поспать перед новым полным
+        коннектом (см. run()).
         """
         last_err = None
-        delay = 2.0
-        for attempt in range(1, 5):
+        delay = 0.5
+        for attempt in range(1, 4):
             try:
                 return self._handshake_once()
             except (OSError, ConnectionError) as e:
@@ -229,12 +237,12 @@ class RawWSClient:
                 except Exception:
                     pass
                 self.sock = None
-                if attempt < 4:
-                    log(f"[ws] Handshake: попытка {attempt}/4 не прошла "
-                        f"({type(e).__name__}: {e}) — повтор через {delay:.0f} c...")
+                if attempt < 3:
+                    log(f"[ws] Handshake: попытка {attempt}/3 не прошла "
+                        f"({type(e).__name__}: {e}) — повтор через {delay:.1f} c...")
                     time.sleep(delay)
                     delay *= 2
-        raise ConnectionError(f"WS handshake failed (4 попытки): {last_err}")
+        raise ConnectionError(f"WS handshake failed (3 попытки): {last_err}")
 
     # ---------- низкоуровневые операции с кадрами ----------
     def _read_exact(self, n, deadline):
@@ -610,32 +618,58 @@ class TwitchChatThread(threading.Thread):
         # Вечный цикл: подключение -> чтение -> при любой ошибке переподключение.
         # Библиотека `websockets` больше НЕ нужна ни в одном режиме: и WSS 443,
         # и TCP 6667 работают нативными клиентами (RawWSClient / RawTCPClient).
+        # ВАЖНО: при заданном oauth_token NICK ОБЯЗАН совпадать с логином
+        # владельца токена (в нижнем регистре). Twitch проверяет пару
+        # NICK+PASS и на несоответствие отвечает
+        # "NOTICE * :Improperly formatted auth" и молча не пускает в канал.
+        token = (self.config.get("oauth_token") or "").strip()
+        cfg_nick = (self.config.get("nickname") or "").strip().lower()
+        if token and not cfg_nick:
+            log("[irc] В settings.json есть oauth_token, но пустой nickname — "
+                "для авторизованного входа NICK должен совпадать с логином "
+                "владельца токена. Временный fallback: анонимный justinfan*.")
+        # АНОНИМНЫЙ вход justinfan* — ПЕРВЫЙ вариант по умолчанию.
+        # Проверено живым тестом (tests/twitch_connect_test.py --wss, 300 c
+        # без единого обрыва): анонимное WS-соединение к Twitch держится
+        # стабильно. Авторизованный вход тем же токеном/NICK наоборот
+        # умирал волнами «сервер закрыл соединение (0 байт)» сразу после
+        # connect() — см. логи 14–15.10. Для простого НАБЛЮДЕНИЯ за чатом
+        # авторизация не нужна вовсе; если вы хотите писать в чат или
+        # читать закрытые каналы — явно поставьте в settings.json
+        # "irc_prefer_auth": true.
+        prefer_auth = bool(self.config.get("irc_prefer_auth", False))
+        if token and not prefer_auth:
+            log("[irc] oauth_token в конфиге есть, но для наблюдения он НЕ нужен — "
+                "подключаюсь анонимно (justinfan*). Это лечит мгновенные обрывы "
+                "WS-соединений у Twitch. Чтобы включить авторизованный вход: "
+                "\"irc_prefer_auth\": true в settings.json.")
+            token = ""
+        nick = cfg_nick if (token and cfg_nick) else (cfg_nick or f"justinfan{int(time.time()) % 99999}")
+        if token:
+            log(f"[irc] Авторизованный вход: NICK={nick} + PASS oauth:***")
+        backoff = 5.0   # пауза перед новым коннектом; растёт при повторных
+                        # смертях, чтобы НЕ долбить Twitch handshake'ами
+                        # (частые handshake с одного IP — причина банов edge)
         while not self.stop_event.is_set():
-            # ВАЖНО: при заданном oauth_token NICK ОБЯЗАН совпадать с логином
-            # владельца токена (в нижнем регистре). Twitch проверяет пару
-            # NICK+PASS и на несоответствие отвечает
-            # "NOTICE * :Improperly formatted auth" и молча не пускает в канал.
-            token = (self.config.get("oauth_token") or "").strip()
-            cfg_nick = (self.config.get("nickname") or "").strip().lower()
-            if token and not cfg_nick:
-                log("[irc] В settings.json есть oauth_token, но пустой nickname — "
-                    "для авторизованного входа NICK должен совпадать с логином "
-                    "владельца токена. Временный fallback: анонимный justinfan*.")
-            nick = cfg_nick if (token and cfg_nick) else (cfg_nick or f"justinfan{int(time.time()) % 99999}")
-            if token:
-                log(f"[irc] Авторизованный вход: NICK={nick} + PASS oauth:***")
             try:
                 self._connect_and_read(nick, channels)
                 # Соединение отработало и завершилось (штатно или по ошибке чтения),
                 # но ДОЛГО — значит текущий транспорт в целом рабочий: снимаем
-                # счётчик сбоев handshake, чтобы единичные NetworkError не включали
-                # принудительный tcp-first.
+                # счётчик сбоев handshake и бэкофф, чтобы единичные NetworkError
+                # не включали принудительный tcp-first.
                 if getattr(self, "_conn_was_healthy", False):
                     self._ws_handshake_fails = 0
+                    backoff = 5.0
             except Exception as e:
                 self._note_transport_failure(e)
-                log(f"[irc] Ошибка соединения ({type(e).__name__}: {e}). Переподключение через 5 c...")
-            if self.stop_event.wait(5.0):
+                log(f"[irc] Ошибка соединения ({type(e).__name__}: {e}). "
+                    f"Переподключение через {backoff:.0f} c...")
+            # Короткая жизнь соединения (<20 c) = волна отказов транспорта:
+            # увеличиваем паузу до 30 c максимум (обратная сторона прежнего
+            # бага — сервис долбил WS каждые 5 c и получал всё больше обрывов).
+            if getattr(self, "_last_conn_lifetime", 999) < 20:
+                backoff = min(backoff * 2, 30.0)
+            if self.stop_event.wait(backoff):
                 break
 
     def _open_conn(self):
@@ -1014,9 +1048,11 @@ class TwitchChatThread(threading.Thread):
                         self.store.touch(login, tags.get("display-name", nick_user),
                                          tags.get("color", ""), is_mod=is_mod)
             log(f"[irc] Поток чата остановлен. Принято сообщений за это соединение: {got_msgs}.")
+            lifetime = (time.time() - self.connected_at) if self.connected_at else 0
+            self._last_conn_lifetime = lifetime
             # «Здоровым» считаем соединение, которое продержалось дольше минуты —
             # для него транспорт точно рабочий (см. сброс _ws_handshake_fails в run())
-            if self.connected_at and time.time() - self.connected_at > 60:
+            if lifetime > 60:
                 self._conn_was_healthy = True
             elif getattr(self, "last_transport", "").startswith("WebSocket"):
                 # Соединение УМЕРЛО менее чем через минуту после connect().
