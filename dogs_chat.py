@@ -163,32 +163,71 @@ class RawWSClient:
         self._frag = b""        # собранный незавершённый фрагментированный кадр
         self._frag_op = None
 
-    def connect(self):
+    def _handshake_once(self):
         key = base64.b64encode(os.urandom(16)).decode()
         ctx = ssl.create_default_context()
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+        try:
+            self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+        except OSError:
+            # TLS-handshake упал — закрываем голый сокет, чтобы не течь по fd
+            try:
+                raw.close()
+            except Exception:
+                pass
+            raise
         req = (f"GET / HTTP/1.1\r\nHost: {self.host}\r\nOrigin: https://twitch.tv\r\n"
                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.settimeout(self.timeout)
         self.sock.sendall(req.encode())
         resp = b""
         while b"\r\n\r\n" not in resp:
             chunk = self.sock.recv(4096)
             if not chunk:
-                raise ConnectionError("WS handshake: соединение закрыто")
+                raise ConnectionError("WS handshake: сервер закрыл соединение на handshake")
             resp += chunk
         head, rest = resp.split(b"\r\n\r\n", 1)
         status = head.split(b"\r\n", 1)[0].decode(errors="replace")
         if "101" not in status:
-            raise ConnectionError(f"WS handshake failed: {status}")
+            snippet = head.decode(errors="replace")[:300].replace("\r\n", " | ")
+            raise ConnectionError(f"WS handshake failed: {status} :: {snippet}")
         expect = base64.b64encode(hashlib.sha1(
             (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
         if expect.lower().encode() not in head.lower():
             raise ConnectionError(f"WS handshake: неверный Sec-WebSocket-Accept в {status!r}")
         self.buf = rest
-        self.sock.settimeout(None)   # неблокирующий режим управляется в recv()
+        self.sock.settimeout(None)   # таймауты чтения управляются внутри recv()
         return self
+
+    def connect(self):
+        """Handshake с одной автоматической ретраи.
+
+        Живой лог 14.10 16:31 показал мигание «сервер закрыл соединение
+        (0 байт)» каждые несколько секунд СРАЗУ после connect(). Причина —
+        гонка в этом методе: раньше `settimeout(None)` ставился ДО отправки
+        upgrade-запроса, и если Twitch не отвечал мгновенно, блокирующий
+        recv() зависал навсегда (потом его убивал только close() потока).
+        Теперь весь handshake идёт под нормальным таймаутом, а при единичном
+        сетевом сбое делаем одну повторную попытку через 2 c.
+        """
+        last_err = None
+        for attempt in (1, 2):
+            try:
+                return self._handshake_once()
+            except (OSError, ConnectionError) as e:
+                last_err = e
+                try:
+                    if self.sock:
+                        self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+                if attempt == 1:
+                    log(f"[ws] Handshake не прошёл с первой попытки "
+                        f"({type(e).__name__}: {e}) — повторяю через 2 c...")
+                    time.sleep(2.0)
+        raise ConnectionError(f"WS handshake failed (2 попытки): {last_err}")
 
     # ---------- низкоуровневые операции с кадрами ----------
     def _read_exact(self, n, deadline):
@@ -251,7 +290,9 @@ class RawWSClient:
             if op == self.OP_PONG:
                 continue
             if op == self.OP_CLOSE:
-                raise ConnectionError("WS: сервер закрыл соединение (CLOSE)")
+                code = struct.unpack("!H", payload[:2])[0] if ln >= 2 else 0
+                reason = payload[2:].decode("utf-8", "replace")[:120] if ln > 2 else ""
+                raise ConnectionError(f"WS: сервер закрыл соединение (CLOSE {code} {reason!r})")
             if op in (self.OP_TEXT, self.OP_BIN):
                 if fin:
                     return payload
@@ -578,7 +619,14 @@ class TwitchChatThread(threading.Thread):
                 log(f"[irc] Авторизованный вход: NICK={nick} + PASS oauth:***")
             try:
                 self._connect_and_read(nick, channels)
+                # Соединение отработало и завершилось (штатно или по ошибке чтения),
+                # но ДОЛГО — значит текущий транспорт в целом рабочий: снимаем
+                # счётчик сбоев handshake, чтобы единичные NetworkError не включали
+                # принудительный tcp-first.
+                if getattr(self, "_conn_was_healthy", False):
+                    self._ws_handshake_fails = 0
             except Exception as e:
+                self._note_transport_failure(e)
                 log(f"[irc] Ошибка соединения ({type(e).__name__}: {e}). Переподключение через 5 c...")
             if self.stop_event.wait(5.0):
                 break
@@ -619,6 +667,42 @@ class TwitchChatThread(threading.Thread):
             except Exception as e:
                 errors.append(f"tcp6667: {type(e).__name__}: {e}")
         raise ConnectionError("Не удалось подключиться ни одним способом -> " + " | ".join(errors))
+
+    def _note_transport_failure(self, err):
+        """Если WS-рукопожатие стабильно не проходит (не единичный сетевой сбой,
+        а например TLS-инспекция/файрвол режут handshake), переключить ПОРЯДОК
+        транспортов: TCP 6667 становится основным, WS — запасным. Состояние
+        живёт только в памяти процесса и сбрасывается рестартом сервиса."""
+        s = str(err)
+        if "handshake" not in s.lower():
+            return
+        self._ws_handshake_fails = getattr(self, "_ws_handshake_fails", 0) + 1
+        if self._ws_handshake_fails >= 2 and getattr(self, "_transport_order", "ws-first") == "ws-first":
+            self._transport_order = "tcp-first"
+            log("[irc] WS-handshake провалился 2 раза подряд — переключаюсь на "
+                "основной транспорт TCP 6667 (WS останется запасным). Это может "
+                "означать TLS-инспекцию/блокировку handshake на порту 443.")
+
+    def _open_conn_ordered(self):
+        """Открыть соединение с учётом динамического порядка транспортов."""
+        if getattr(self, "_transport_order", "ws-first") == "tcp-first":
+            order = (self.config.get("irc_transport") or "").strip().lower()
+            if order in ("", "auto", "tcp"):
+                try:
+                    conn = RawTCPClient(TWITCH_TCP_HOST, TWITCH_TCP_PORT)
+                    self.last_transport = "TCP 6667"
+                    return conn
+                except Exception as e:
+                    self.errors_list = [f"tcp6667(preferred): {type(e).__name__}: {e}"]
+            try:
+                conn = RawWSClient(TWITCH_WS_URL, timeout=15.0).connect()
+                self.last_transport = "WebSocket wss://443"
+                return conn
+            except Exception as e:
+                raise ConnectionError(
+                    "Не удалось подключиться (tcp-first) -> "
+                    + " | ".join(getattr(self, "errors_list", [])) + f" | wss: {type(e).__name__}: {e}")
+        return self._open_conn()
 
     def _log_alive(self, force=False):
         """Каждые 120 секунд писать в journal сводку: живо ли соединение и
@@ -679,7 +763,7 @@ class TwitchChatThread(threading.Thread):
         log(f"[cmds] Команды от сервера за соединение #{self.conn_id}: {cmds}")
 
     def _connect_and_read(self, nick: str, channels: list):
-        conn = self._open_conn()
+        conn = self._open_conn_ordered()
 
         with conn:
             def send(s):
@@ -910,6 +994,10 @@ class TwitchChatThread(threading.Thread):
                         self.store.touch(login, tags.get("display-name", nick_user),
                                          tags.get("color", ""), is_mod=is_mod)
             log(f"[irc] Поток чата остановлен. Принято сообщений за это соединение: {got_msgs}.")
+            # «Здоровым» считаем соединение, которое продержалось дольше минуты —
+            # для него транспорт точно рабочий (см. сброс _ws_handshake_fails в run())
+            if self.connected_at and time.time() - self.connected_at > 60:
+                self._conn_was_healthy = True
             self.connected_at = None  # чтобы [alive] честно писал «не установлено»
 
     def stop(self):
