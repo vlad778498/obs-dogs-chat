@@ -228,7 +228,13 @@ class RawWSClient:
         delay = 0.5
         for attempt in range(1, 4):
             try:
-                return self._handshake_once()
+                conn = self._handshake_once()
+                # Ключевая проверка: Twitch может ответить 101 и тут же
+                # закрыть сокет (rate-limit по IP / кривой Origin). Без
+                # этой проверки такой транспорт считался «успешным», и
+                # сервис попадал в цикл мгновенных смертей каждые 5-10 c.
+                conn.verify_alive(wait_s=5.0)
+                return conn
             except (OSError, ConnectionError) as e:
                 last_err = e
                 try:
@@ -243,6 +249,28 @@ class RawWSClient:
                     time.sleep(delay)
                     delay *= 2
         raise ConnectionError(f"WS handshake failed (3 попытки): {last_err}")
+
+    def verify_alive(self, wait_s=5.0):
+        """После handshake проверить, что сервер НЕ закрыл соединение сразу.
+
+        Twitch при rate-limit/подозрительном Origin закрывает WS через 0-1 c
+        ПОСЛЕ успешного 101. Ждём первые байты: любой входящий кадр или наш
+        PING -> PONG подтверждают живость. Если за wait_s сокет закрылся
+        (recv вернул пусто) — это провал транспорта, бросаем ConnectionError,
+        чтобы connect() мог ретраить, а run() учёл волну отказов.
+        Возвращает True, если соединение живо.
+        """
+        self.sock.settimeout(wait_s)
+        try:
+            chunk = self.sock.recv(65536)
+        except (socket.timeout, TimeoutError):
+            return True          # тишина, но сокет ОТКРЫТ — живой
+        finally:
+            self.sock.settimeout(None)
+        if not chunk:
+            raise ConnectionError("WS: сервер закрыл соединение сразу после handshake")
+        self.buf += chunk
+        return True
 
     # ---------- низкоуровневые операции с кадрами ----------
     def _read_exact(self, n, deadline):
@@ -820,6 +848,11 @@ class TwitchChatThread(threading.Thread):
         conn = self._open_conn_ordered()
 
         with conn:
+            # TCP-клиент не умеет verify_alive (у него нет handshake-фазы) —
+            # проверка только для WS.
+            if hasattr(conn, "verify_alive"):
+                conn.verify_alive(wait_s=5.0)
+
             def send(s):
                 conn.send(s.encode() if isinstance(s, str) else s)
             # Порядок: NICK -> CAP REQ -> JOIN. Пустой PASS не отправляем —
