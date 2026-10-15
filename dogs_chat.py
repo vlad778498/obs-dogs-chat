@@ -80,6 +80,29 @@ def log(*args):
     print(*args, file=sys.stderr, flush=True)
 
 
+EXCLUDE_PATH = BASE_DIR / "config" / "exclude.txt"
+
+
+def parse_exclude_lines(text: str) -> set:
+    """Разбирает содержимое exclude.txt в множество ников (нижний регистр).
+
+    Правила: одна строка = один ник; пустые строки и строки с «#» в начале
+    пропускаются; ведущий «@» снимается; комментарий после ника («Nick # note»)
+    отбрасывается. Ник может содержать решётку внутри — тогда она сохраняется
+    (сначала идёт ник, потом пробел и комментарий)."""
+    out = set()
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        # «Nick  # комментарий» -> берём только первую часть до пробела
+        s = s.split()[0]
+        s = s.lstrip("@").strip().lower()
+        if s:
+            out.add(s)
+    return out
+
+
 class ActivityStore:
     """Потокобезопасное хранилище: user -> last_seen_ts."""
 
@@ -87,8 +110,40 @@ class ActivityStore:
         self.lock = threading.Lock()
         self.users: "OrderedDict[str, dict]" = OrderedDict()  # login -> {name,color,last}
         self.config = config
+        # Список исключений (config/exclude.txt): ники, которые не появятся
+        # на экране. Файл перечитывается на лету (см. _excluded()), сервис
+        # перезапускать не нужно.
+        self._exclude_cache = set()
+        self._exclude_mtime = None
+        self._exclude_checked_at = 0.0
+
+    def _excluded(self, login: str) -> bool:
+        """True, если ник в списке исключений (config/exclude.txt)."""
+        now = time.time()
+        # перечитываем файл не чаще раза в 5 секунд (по mtime)
+        if now - self._exclude_checked_at >= 5.0:
+            self._exclude_checked_at = now
+            try:
+                mtime = EXCLUDE_PATH.stat().st_mtime
+                if mtime != self._exclude_mtime:
+                    self._exclude_mtime = mtime
+                    self._exclude_cache = parse_exclude_lines(
+                        EXCLUDE_PATH.read_text(encoding="utf-8"))
+                    log(f"[exclude] Загружено исключений: {len(self._exclude_cache)} "
+                        f"(файл {EXCLUDE_PATH})")
+            except FileNotFoundError:
+                if self._exclude_cache or self._exclude_mtime is not None:
+                    log("[exclude] Файл config/exclude.txt не найден — исключений нет.")
+                self._exclude_cache = set()
+                self._exclude_mtime = None
+            except Exception as e:
+                log(f"[exclude] Не удалось прочитать {EXCLUDE_PATH}: {e}")
+        return login.lower() in self._exclude_cache
 
     def touch(self, login: str, display_name: str = "", color: str = "", is_mod: bool = False):
+        # Ник из config/exclude.txt — не попадает на экран вообще.
+        if self._excluded(login):
+            return
         now = time.time()
         with self.lock:
             u = self.users.get(login)
@@ -111,8 +166,10 @@ class ActivityStore:
         window = self.config.get("active_window_seconds", 3600)
         cutoff = time.time() - window
         with self.lock:
-            # prune старых
-            stale = [k for k, v in self.users.items() if v["last"] < cutoff]
+            # prune старых + тех, кого пользователь добавил в exclude.txt
+            # уже ПОСЛЕ того, как они появились на экране (исчезают сразу)
+            stale = [k for k, v in self.users.items()
+                     if v["last"] < cutoff or k.lower() in self._exclude_cache]
             for k in stale:
                 del self.users[k]
             items = []
