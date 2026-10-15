@@ -318,22 +318,44 @@
     return isNaN(cur) ? fallback : cur;
   }
 
+  // Безопасное число: NaN/null/строка -> def; законные 0 и отрицательные — ок.
+  function num2(v, def) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : def;
+  }
+
   function applyDisplayCfg(c) {
     Object.assign(DisplayCfg, c || {});
+    // Защита от «дырявых» значений в display.json: null/NaN/строки приводим
+    // к безопасным числам. ВАЖНО: проверяем через Number.isFinite, а не через
+    // `x || дефолт` — иначе законное значение 0 (например dog_scale: 0)
+    // молча подменялось бы дефолтом и конфиг «не применялся».
+    const num = (v, def, lo, hi) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def;
+    };
+    DisplayCfg.dog_scale       = num(DisplayCfg.dog_scale, 1.0, 0.2, 5);
+    DisplayCfg.kennel_scale    = num(DisplayCfg.kennel_scale, 1.0, 0.2, 5);
+    DisplayCfg.name_font_px    = num(DisplayCfg.name_font_px, 14, 6, 200);
+    DisplayCfg.ground_offset_px= num(DisplayCfg.ground_offset_px, 0, -500, 500);
+    DisplayCfg.crowd_scale_min = num(DisplayCfg.crowd_scale_min, 0.6, 0.2, 1);
+    DisplayCfg.crowd_dogs_for_min = num(DisplayCfg.crowd_dogs_for_min, 18, 1, 10000);
+    if (!/^#[0-9a-fA-F]{3,8}$/.test(String(DisplayCfg.name_color || "")))
+      DisplayCfg.name_color = "#ffffff";
     const root = document.documentElement;
     // масштаб будки
     root.style.setProperty("--kennel-h",
-      (cssNumPx("--kennel-base", 150) * Math.max(0.2, DisplayCfg.kennel_scale)) + "px");
+      (cssNumPx("--kennel-base", 150) * DisplayCfg.kennel_scale) + "px");
     // тонировка собак в цвет ника
     const scene = document.getElementById("scene");
     if (scene) scene.classList.toggle("no-tint", !DisplayCfg.tint_by_name_color);
     // ник: размер/цвет/тень/зазор
-    root.style.setProperty("--name-font", Math.max(6, DisplayCfg.name_font_px || 14) + "px");
-    root.style.setProperty("--name-color", DisplayCfg.name_color || "#ffffff");
-    root.style.setProperty("--name-gap", (Number.isFinite(+DisplayCfg.name_gap_px) ? +DisplayCfg.name_gap_px : -14) + "px");
+    root.style.setProperty("--name-font", DisplayCfg.name_font_px + "px");
+    root.style.setProperty("--name-color", DisplayCfg.name_color);
+    root.style.setProperty("--name-gap", num(DisplayCfg.name_gap_px, -14, -200, 200) + "px");
     if (scene) scene.classList.toggle("no-name-shadow", !DisplayCfg.name_shadow);
     // пол
-    root.style.setProperty("--ground", Math.max(0, DisplayCfg.ground_offset_px || 0) + "px");
+    root.style.setProperty("--ground", DisplayCfg.ground_offset_px + "px");
     // модераторы на крыше
     if (roost && roost.parentElement)
       roost.parentElement.style.display = DisplayCfg.show_mods_on_roof ? "" : "none";
@@ -430,15 +452,25 @@
   }
 
   let lastCfgJson = "";
+  let cfgTries = 0;        // сколько раз не удалось загрузить конфиг (для диагностики)
   function fetchDisplayCfg() {
     fetch("/api/config", { cache: "no-store" })
-      .then((r) => r.ok ? r.json() : null)
+      .then((r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
       .then((c) => {
-        if (!c) return;
+        if (!c || typeof c !== "object") return;
+        cfgTries = 0;
         const j = JSON.stringify(c);
         if (j !== lastCfgJson) { lastCfgJson = j; applyDisplayCfg(c); }
       })
-      .catch(() => {});   // конфиг опционален — живём на значениях по умолчанию
+      .catch((e) => {
+        // конфиг опционален — живём на предыдущих/дефолтных значениях,
+        // но пробуем перезагрузиться чаще (1 c), пока не дойдёт
+        cfgTries++;
+        setTimeout(fetchDisplayCfg, 1000);
+      });
   }
 
   // =========================================================================
@@ -601,7 +633,7 @@
   function updateCrowdScale() {
     const c = DisplayCfg;
     const n = dogs.size;
-    let target = Math.max(0.2, Math.min(5, c.dog_scale || 1));
+    let target = num2(c.dog_scale, 1.0);   // Number.isFinite — законный 0 не подменяем дефолтом
     if (c.crowd_auto_scale && n > (c.crowd_dogs_for_min || 18)) {
       const over = n - (c.crowd_dogs_for_min || 18);
       target *= Math.max(Math.min(1, c.crowd_scale_min || 0.6), 1 - over * 0.03);
