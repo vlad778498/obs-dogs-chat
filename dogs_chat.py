@@ -853,8 +853,18 @@ class TwitchChatThread(threading.Thread):
             if hasattr(conn, "verify_alive"):
                 conn.verify_alive(wait_s=5.0)
 
+            # ВАЖНО (корень бага «WS 443: сервер закрыл соединение (0 байт)»
+            # мгновенно после JOIN — логи 02:51): отправку надо выбирать по
+            # ТИПУ соединения, а не по типу данных. RawWSClient.send(bytes)
+            # упаковывает payload в BINARY-кадр (opcode 0x2), а Twitch требует
+            # TEXT (0x1) и молча рвёт соединение на бинарных кадрах. Старый код
+            # делал s.encode() для ВСЕХ транспортов -> WS всегда получал BIN ->
+            # handshake проходил, а умирало соединение сразу после NICK/JOIN.
+            # RawTCPClient принимает и str, и bytes — ему передаём как есть.
+            is_ws = hasattr(conn, "verify_alive")
+
             def send(s):
-                conn.send(s.encode() if isinstance(s, str) else s)
+                conn.send(s if is_ws else (s.encode() if isinstance(s, str) else s))
             # Порядок: NICK -> CAP REQ -> JOIN. Пустой PASS не отправляем —
             # проверено живым тестом против irc.chat.twitch.tv:6667: строка
             # "PASS " (без токена) злит соединение без ответа, а анонимный вход
