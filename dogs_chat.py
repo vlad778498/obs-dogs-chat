@@ -1442,20 +1442,44 @@ DEFAULT_DISPLAY_CONFIG = {
 }
 
 
+# Кэш display.json по mtime; при ошибке парсинга храним последний ДОБРОКАЧЕСТВЕННЫЙ
+# конфиг (иначе битый файл молча подменялся дефолтами — «display перестал применяться»).
+_display_cache = {"mtime": None, "cfg": None}
+
+
 def load_display_config() -> dict:
-    cfg = dict(DEFAULT_DISPLAY_CONFIG)
-    if DISPLAY_CONFIG_PATH.exists():
-        try:
-            cfg.update(json.loads(DISPLAY_CONFIG_PATH.read_text(encoding="utf-8")))
-        except Exception as e:
-            log(f"[config] Не удалось прочитать {DISPLAY_CONFIG_PATH}: {e}")
-    else:
+    base = dict(DEFAULT_DISPLAY_CONFIG)
+    try:
+        st = DISPLAY_CONFIG_PATH.stat()
+    except FileNotFoundError:
         DISPLAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         DISPLAY_CONFIG_PATH.write_text(
-            json.dumps(DEFAULT_DISPLAY_CONFIG, ensure_ascii=False, indent=2),
-            encoding="utf-8")
+            json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8")
+        _display_cache["mtime"] = None
+        _display_cache["cfg"] = base
         log(f"[config] Создан конфиг отображения: {DISPLAY_CONFIG_PATH}")
-    return cfg
+        return dict(base)
+    mtime = st.st_mtime
+    if _display_cache["cfg"] is not None and mtime == _display_cache["mtime"]:
+        return dict(_display_cache["cfg"])          # файл не менялся — отдаём кэш
+    try:
+        text = DISPLAY_CONFIG_PATH.read_text(encoding="utf-8-sig")
+        user_cfg = json.loads(text)
+        if not isinstance(user_cfg, dict):
+            raise ValueError("корень JSON должен быть объектом {...}")
+        merged = dict(base)
+        merged.update(user_cfg)
+        _display_cache["mtime"] = mtime
+        _display_cache["cfg"] = merged
+        log(f"[config] display.json перечитан ({len(user_cfg)} ключей пользователя)")
+        return dict(merged)
+    except Exception as e:
+        # НЕ подменяем настройки дефолтами: держим последний валидный конфиг.
+        fallback = _display_cache["cfg"] or base
+        log(f"[config] ВНИМАНИЕ: {DISPLAY_CONFIG_PATH} не разобран ({e}); "
+            f"применяю последний исправный конфиг. Правки из файла игнорируются, "
+            f"пока синтаксис не будет исправлен.")
+        return dict(fallback)
 
 
 def load_config() -> dict:
