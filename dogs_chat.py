@@ -164,6 +164,8 @@ class RawWSClient:
         self._frag_op = None
 
     def _handshake_once(self):
+        # НОВЫЙ key на каждую попытку: если Twitch/прокси отвергнет один ключ,
+        # повтор с тем же самым key мог «отбиваться» той же ошибкой.
         key = base64.b64encode(os.urandom(16)).decode()
         ctx = ssl.create_default_context()
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
@@ -201,18 +203,22 @@ class RawWSClient:
         return self
 
     def connect(self):
-        """Handshake с одной автоматической ретраи.
+        """Handshake с ретраями и экспоненциальной задержкой (2, 4, 8 c).
 
-        Живой лог 14.10 16:31 показал мигание «сервер закрыл соединение
-        (0 байт)» каждые несколько секунд СРАЗУ после connect(). Причина —
-        гонка в этом методе: раньше `settimeout(None)` ставился ДО отправки
-        upgrade-запроса, и если Twitch не отвечал мгновенно, блокирующий
-        recv() зависал навсегда (потом его убивал только close() потока).
-        Теперь весь handshake идёт под нормальным таймаутом, а при единичном
-        сетевом сбое делаем одну повторную попытку через 2 c.
+        Живые логи 14–15.10 показали два режима отказов:
+          * единичные сетевые сбои — лечатся простым повтором;
+          * «сервер закрыл соединение (0 байт)» СРАЗУ после успешного
+            connect(), волнами по нескольку минут подряд (типично для
+            временного баня IP у edge-ноды Twitch или реза провайдером).
+        Одна ретрай-попытка тут не помогала: мы долбили тот же endpoint раз
+        в 5-6 секунд, что лишь продлевало бан. Теперь до 4 попыток с
+        нарастающей паузой; между ними TCP+TLS пересоздаются заново, key —
+        новый. Если все попытки неудачны — исключение наверх, где поток
+        спит 5 c и пробует снова (плюс откат на TCP 6667 после 2 волн).
         """
         last_err = None
-        for attempt in (1, 2):
+        delay = 2.0
+        for attempt in range(1, 5):
             try:
                 return self._handshake_once()
             except (OSError, ConnectionError) as e:
@@ -223,11 +229,12 @@ class RawWSClient:
                 except Exception:
                     pass
                 self.sock = None
-                if attempt == 1:
-                    log(f"[ws] Handshake не прошёл с первой попытки "
-                        f"({type(e).__name__}: {e}) — повторяю через 2 c...")
-                    time.sleep(2.0)
-        raise ConnectionError(f"WS handshake failed (2 попытки): {last_err}")
+                if attempt < 4:
+                    log(f"[ws] Handshake: попытка {attempt}/4 не прошла "
+                        f"({type(e).__name__}: {e}) — повтор через {delay:.0f} c...")
+                    time.sleep(delay)
+                    delay *= 2
+        raise ConnectionError(f"WS handshake failed (4 попытки): {last_err}")
 
     # ---------- низкоуровневые операции с кадрами ----------
     def _read_exact(self, n, deadline):
@@ -669,19 +676,32 @@ class TwitchChatThread(threading.Thread):
         raise ConnectionError("Не удалось подключиться ни одним способом -> " + " | ".join(errors))
 
     def _note_transport_failure(self, err):
-        """Если WS-рукопожатие стабильно не проходит (не единичный сетевой сбой,
-        а например TLS-инспекция/файрвол режут handshake), переключить ПОРЯДОК
+        """Если WS нестабилен (не проходит handshake ИЛИ сервер закрывает
+        соединение сразу после connect'а — «0 байт»), переключить ПОРЯДОК
         транспортов: TCP 6667 становится основным, WS — запасным. Состояние
-        живёт только в памяти процесса и сбрасывается рестартом сервиса."""
-        s = str(err)
-        if "handshake" not in s.lower():
+        живёт только в памяти процесса и сбрасывается рестартом сервиса.
+
+        Логика порога: connect() сам делает до 4 попыток с экспоненциальной
+        паузой; если вся эта процедура провалилась — это уже «одна волна».
+        Две волны подряд (или две мгновенные смерти соединения <5 c) —
+        достаточно, чтобы признать WS на этой сети нерабочим и уйти на TCP.
+        Обратное переключение: соединение, прожившее >60 c, обнуляет счётчик
+        (см. run() / _conn_was_healthy), поэтому временный сбой WS не приводит
+        к вечному tcp-first."""
+        s = str(err).lower()
+        ws_broken = ("handshake" in s or "закрыл соединение" in s
+                     or "close" in s or "0 байт" in s)
+        if not ws_broken:
             return
         self._ws_handshake_fails = getattr(self, "_ws_handshake_fails", 0) + 1
         if self._ws_handshake_fails >= 2 and getattr(self, "_transport_order", "ws-first") == "ws-first":
             self._transport_order = "tcp-first"
-            log("[irc] WS-handshake провалился 2 раза подряд — переключаюсь на "
-                "основной транспорт TCP 6667 (WS останется запасным). Это может "
-                "означать TLS-инспекцию/блокировку handshake на порту 443.")
+            log("[irc] WebSocket 443 нестабилен (2 волны отказов подряд) — "
+                "переключаюсь на основной транспорт TCP 6667 (WS останется "
+                "запасным). Типичные причины: TLS-инспекция/блокировка "
+                "handshake на 443 или временный бан IP у edge-ноды Twitch. "
+                "После того как любое соединение проживёт >60 c, WS снова "
+                "станет основным автоматически.")
 
     def _open_conn_ordered(self):
         """Открыть соединение с учётом динамического порядка транспортов."""
@@ -998,6 +1018,25 @@ class TwitchChatThread(threading.Thread):
             # для него транспорт точно рабочий (см. сброс _ws_handshake_fails в run())
             if self.connected_at and time.time() - self.connected_at > 60:
                 self._conn_was_healthy = True
+            elif getattr(self, "last_transport", "").startswith("WebSocket"):
+                # Соединение УМЕРЛО менее чем через минуту после connect().
+                # Это ровно тот паттерн из логов 15.10: «Подключено (WebSocket
+                # wss://443)» -> через 0-1 c «сервер закрыл соединение (0 байт)».
+                # Handshake формально прошёл, поэтому run() ловит не исключение
+                # и _note_transport_failure() не вызывается — счётчик волн WS
+                # никогда не набирался и tcp-first-откат не срабатывал.
+                # Учитываем такую мгновенную смерть как провал WS здесь.
+                self._ws_handshake_fails = getattr(self, "_ws_handshake_fails", 0) + 1
+                if self._ws_handshake_fails == 1:
+                    log("[irc] WS-соединение умерло сразу после подключения "
+                        "(менее минуты). При повторе такого же перехода на "
+                        "TCP 6667 как основной транспорт.")
+                elif self._ws_handshake_fails >= 2 and getattr(self, "_transport_order", "ws-first") == "ws-first":
+                    self._transport_order = "tcp-first"
+                    log("[irc] WebSocket 443 нестабилен (несколько мгновенных "
+                        "смертей подряд) — переключаюсь на основной транспорт "
+                        "TCP 6667 (WS останется запасным). После соединения, "
+                        "прожившего >60 c, WS снова станет основным сам.")
             self.connected_at = None  # чтобы [alive] честно писал «не установлено»
 
     def stop(self):
