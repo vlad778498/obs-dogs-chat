@@ -1297,6 +1297,13 @@ class Handler(BaseHTTPRequestHandler):
             }
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
+        elif path == "/api/config":
+            # Конфиг отображения (config/display.json) — перечитывается с диска
+            # при каждом запросе, поэтому правка файла применяется на лету:
+            # UI опрашивает этот адрес каждые несколько секунд.
+            data = load_display_config()
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
         elif path == "/favicon.ico":
             self._send(204, "image/x-icon", b"")
         elif path.startswith("/assets/"):
@@ -1339,6 +1346,61 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Конфиг ОТОБРАЖЕНИЯ (собаки/конура): config/display.json.
+# Отдельный файл от settings.json, чтобы настройки внешнего вида можно было
+# править и перезагружать на лету, не трогая подключение к Twitch.
+# Сервер отдаёт его через GET /api/config; UI применяет значения сразу
+# (без перезапуска сервиса). Файл перечитывается при каждом запросе —
+# правка конфигура = обновил страницу OBS (или сама подхватит в течение ~5 c).
+# ---------------------------------------------------------------------------
+DISPLAY_CONFIG_PATH = BASE_DIR / "config" / "display.json"
+DEFAULT_DISPLAY_CONFIG = {
+    # Ник чатера над собакой
+    "name_font_px": 14,          # размер шрифта ника, пиксели
+    "name_color": "#ffffff",     # цвет ника
+    "name_shadow": True,         # тень/обводка для читаемости на любом фоне
+    "name_gap_px": -14,          # сдвиг ника над головой собаки (отрицательный = выше)
+    "name_max_len": 0,           # обрезать длинные ники до N символов (0 = не обрезать)
+    # Раскраска собаки
+    "tint_by_name_color": True,  # красить ли собаку в цвет ника чатера из Twitch
+    # Размеры
+    "dog_scale": 1.0,            # масштаб собак (1.0 = базовый --dog-size из CSS)
+    "kennel_scale": 1.0,         # масштаб будки/конуры (1.0 = базовый --kennel-h)
+    # Поведение толпы
+    "min_dog_gap": 8,            # минимальная дистанция между собаками, px (0 = выключить)
+    "crowd_auto_scale": True,    # при большом числе собак плавно уменьшать масштаб,
+                                 # чтобы они не залезали друг на друга
+    "crowd_scale_min": 0.6,      # до какого множителя можно уменьшать (при crowd_auto_scale)
+    "crowd_dogs_for_min": 18,    # начиная с скольких собак включается авто-уменьшение
+    # Прочее
+    "ground_offset_px": 0,       # смещение «пола» вверх от нижнего края экрана
+    "show_mods_on_roof": True,   # показывать модераторов на крыше будки
+    # Запретная зона: плашка (алерт/виджет), которую собаки не загораживают.
+    # Координаты — проценты от размеров сцены; y=0 = низ экрана (пол собак).
+    "no_dog_zone_pct": None,     # null = выкл; иначе {"x":35,"y":0,"w":30,"h":25}
+    "no_dog_zone_show": False,   # рисовать пунктирный контур (для настройки в
+                                 # браузере); для OBS держите false — плашка
+                                 # полностью прозрачна и не видна на стриме
+}
+
+
+def load_display_config() -> dict:
+    cfg = dict(DEFAULT_DISPLAY_CONFIG)
+    if DISPLAY_CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(DISPLAY_CONFIG_PATH.read_text(encoding="utf-8")))
+        except Exception as e:
+            log(f"[config] Не удалось прочитать {DISPLAY_CONFIG_PATH}: {e}")
+    else:
+        DISPLAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DISPLAY_CONFIG_PATH.write_text(
+            json.dumps(DEFAULT_DISPLAY_CONFIG, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        log(f"[config] Создан конфиг отображения: {DISPLAY_CONFIG_PATH}")
+    return cfg
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():

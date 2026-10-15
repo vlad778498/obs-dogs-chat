@@ -5,16 +5,27 @@
  * показывается временная заглушка-эмодзи. */
 :root {
   --text: #f2f4fa;
+  /* Базовые размеры до умножения на масштаб из config/display.json.
+     UI пересчитывает: --dog-size = --dog-base * dog_scale,
+     --kennel-h = --kennel-base * kennel_scale. Меняйте base здесь или
+     scale в конфиге — эффект одинаковый. */
+  --dog-base: 90px;
+  --kennel-base: 150px;
   /* Высота СОБАКИ на экране в пикселях. Ширина считается сама из
      пропорций PNG (aspect-ratio), поэтому картинку не сплющивает.
      Пример: dog.png 200x100 при --dog-size:90px => на экране 180x90. */
-  --dog-size: 90px;
+  --dog-size: var(--dog-base);
   /* Высота БУДКИ на экране в пикселях (не ширина!). Ширина — тоже из
      пропорций kennel.png. Пример: kennel.png 300x200 при 150px => 225x150,
      т.е. будка будет в ~1.7 раза выше собаки.
      Ориентиры: 120px ≈ 1.3 собачьих роста, 150px ≈ 1.7, 180px ≈ 2. */
-  --kennel-h: 150px;
+  --kennel-h: var(--kennel-base);
   --ground: 0px;              /* смещение "пола" вверх от нижнего края */
+  /* Настройки ника — переопределяются из config/display.json через JS:
+     name_font_px / name_color / name_shadow / name_gap_px */
+  --name-font: 14px;
+  --name-color: #ffffff;
+  --name-gap: -14px;
   /* Насколько лапы модераторов «втапливаются» в крышу будки.
      Уменьшите, если модераторы висят над крышей; увеличьте, если проваливаются.
      Задаётся здесь, чтобы значение было общим для #kennel и слоя .roost-layer */
@@ -28,10 +39,19 @@ html, body {
   font-family: "Segoe UI", Arial, sans-serif;
   color: var(--text);
   background: transparent;   /* OBS прозрачный фон */
-  overflow: visible;         /* подписи-ники не обрезаются нижним краем */
+  /* overflow:hidden — ОБЯЗАТЕЛЬНО для OBS Browser Source.
+   * Ник (.name) лежит внутри собаки и при transform:scale может вылезать
+   * за край экрана; «visible» здесь OBS трактовал как переполнение сцены и
+   * рисовал полосы прокрутки (страница съезжала). Обрезается только
+   * ник, залезший за край — сами собаки всегда гуляют в пределах экрана
+   * (позиции ограничивает JS: areaW()/dogW()/widthOf()). */
+  overflow: hidden;
 }
 
-#scene { position: relative; width: 100vw; height: 100vh; }
+/* #scene НЕ привязан к 100vw: 100vw включает ширину scrollbar'а и сам
+ * мог создавать горизонтальное переполнение → ползунок → ещё больше
+ * переполнение. Растягиваем через inset вместо vw/vh. */
+#scene { position: absolute; inset: 0; }
 
 /* === будка справа ===========================================================
  * БУДКА. Привязана к нижнему краю (bottom) и к правому (right).
@@ -110,10 +130,30 @@ html, body {
 
 /* --- зона выгула: только горизонтальное движение по нижнему краю -------------- */
 #yard {
-  overflow: visible;
+  /* overflow:hidden — вместе с clampDog() в JS это убирает полосы прокрутки
+   * в OBS Browser Source: уходящая в будку собака и длинный ник обрезаются
+   * границей зоны, а не растягивают страницу. .dog/.name остаются visible.
+   * top:-24px: зона на 24px выше самой собаки, чтобы ник над головой НЕ
+   * обрезался сверху (clip-область включает эту зону). height+24px — пол
+   * остаётся ровно на прежнем месте (bottom зафиксирован). */
+  overflow: hidden;
   position: absolute; left: 0; right: 0; bottom: var(--ground);
-  height: var(--dog-size);
+  top: calc(100% - var(--dog-size) - 24px);
+  height: calc(var(--dog-size) + 24px);
   z-index: 3; pointer-events: none;
+}
+
+/* --- запретная зона (no_dog_zone_pct) --------------------------------------
+ * Невидимая плашка, которую собаки не должны загораживать. Координаты и
+ * размеры задаёт JS из config/display.json (в % от сцены). Контур — только
+ * при no_dog_zone_show=true (настройка в браузере); в OBS держите false. */
+#nodogzone {
+  display: none;
+  position: absolute; bottom: 0; left: 0; width: 0; height: 0;
+  border: 2px dashed rgba(255, 80, 80, .65);
+  background: rgba(255, 80, 80, .08);
+  border-radius: 6px;
+  pointer-events: none; z-index: 1;
 }
 
 .dog {
@@ -155,11 +195,14 @@ html, body {
  * font-size   — размер ника (учитывайте масштаб Browser Source в OBS!);
  * text-shadow — читаемость на любом фоне (обводок нет, только тень). */
 .name {
-  position: absolute; top: -13px; left: 50%; transform: translate(-50%, -2px);
-  font-size: 12px; font-weight: 700; color: #ffffff;
+  position: absolute; top: var(--name-gap, -14px); left: 50%; transform: translate(-50%, -2px);
+  font-size: var(--name-font, 14px); font-weight: 700; color: var(--name-color, #ffffff);
   white-space: nowrap; pointer-events: none; line-height: 1;
   text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 6px rgba(0,0,0,.7);
 }
+/* name_shadow=false из config/display.json — убирает тень (например, если
+   ник уже читается на светлом фоне) */
+#scene.no-name-shadow .name { text-shadow: none; }
 
 @keyframes appear {
   from { opacity: 0; }

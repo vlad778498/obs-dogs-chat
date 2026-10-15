@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 config/settings.json
 .git-credentials
+config/display.json

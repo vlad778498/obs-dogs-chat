@@ -288,6 +288,160 @@
   }
 
   // =========================================================================
+  // Конфиг отображения: config/display.json на сервере -> GET /api/config.
+  // Применяется НА ЛЕТУ (опрос раз в 5 c): правка файла + обновить browser
+  // source в OBS (или просто подождать ~5 c) — без перезапуска сервиса.
+  // =========================================================================
+  const DisplayCfg = {
+    name_font_px: 14, name_color: "#ffffff", name_shadow: true,
+    name_gap_px: -14, name_max_len: 0,
+    tint_by_name_color: true,
+    dog_scale: 1.0, kennel_scale: 1.0,
+    min_dog_gap: 8,
+    crowd_auto_scale: true, crowd_scale_min: 0.6, crowd_dogs_for_min: 18,
+    ground_offset_px: 0, show_mods_on_roof: true,
+    no_dog_zone_pct: null,   // зона, где собакам нельзя останавливаться и толпиться;
+                             // {x,y,w,h} в % от размеров сцены или null = выкл.
+    no_dog_zone_show: false, // показывать ли контур зоны (для настройки в браузере;
+                             // для OBS оставьте false — плашка полностью прозрачна)
+    crowdFactor: 1,          // текущий авто-коэффициент толпы (см. applyDisplayCfg)
+    displayName(name) {      // ник с учётом name_max_len
+      const n = String(name == null ? "" : name);
+      const m = this.name_max_len | 0;
+      return (m > 0 && n.length > m) ? n.slice(0, m) + "…" : n;
+    },
+  };
+
+  function cssNumPx(v, fallback) {
+    const root = document.documentElement;
+    const cur = parseFloat(getComputedStyle(root).getPropertyValue(v));
+    return isNaN(cur) ? fallback : cur;
+  }
+
+  function applyDisplayCfg(c) {
+    Object.assign(DisplayCfg, c || {});
+    const root = document.documentElement;
+    // масштаб будки
+    root.style.setProperty("--kennel-h",
+      (cssNumPx("--kennel-base", 150) * Math.max(0.2, DisplayCfg.kennel_scale)) + "px");
+    // тонировка собак в цвет ника
+    const scene = document.getElementById("scene");
+    if (scene) scene.classList.toggle("no-tint", !DisplayCfg.tint_by_name_color);
+    // ник: размер/цвет/тень/зазор
+    root.style.setProperty("--name-font", Math.max(6, DisplayCfg.name_font_px || 14) + "px");
+    root.style.setProperty("--name-color", DisplayCfg.name_color || "#ffffff");
+    root.style.setProperty("--name-gap", (Number.isFinite(+DisplayCfg.name_gap_px) ? +DisplayCfg.name_gap_px : -14) + "px");
+    if (scene) scene.classList.toggle("no-name-shadow", !DisplayCfg.name_shadow);
+    // пол
+    root.style.setProperty("--ground", Math.max(0, DisplayCfg.ground_offset_px || 0) + "px");
+    // модераторы на крыше
+    if (roost && roost.parentElement)
+      roost.parentElement.style.display = DisplayCfg.show_mods_on_roof ? "" : "none";
+    // пересобрать подписи (name_max_len мог измениться)
+    for (const [, d] of dogs) {
+      const nm = d.el.querySelector(".name");
+      if (nm && d.data) nm.textContent = DisplayCfg.displayName(d.data.name || d.el.dataset.login);
+    }
+    for (const [login, el] of mods) {
+      const nm = el.querySelector(".name");
+      if (nm) nm.textContent = DisplayCfg.displayName(login);
+    }
+    updateNoDogZone();
+    updateCrowdScale();
+    // новые границы clampDog актуальны и при старом масштабе
+    for (const [, d] of dogs) if (!d.leaving) {
+      const before = d.x; clampDog(d);
+      if (Math.abs(before - d.x) > 0.5) reposition(d); else applyPose(d);
+    }
+  }
+
+  // =========================================================================
+  // no_dog_zone_pct — «запретная зона»: плашка (алерт/виджет), которую собаки
+  // не должны загораживать надолго. Задается в config/display.json как
+  // {x, y, w, h} в ПРОЦЕНТАХ от размеров сцены (y — сверху вниз). Собаки:
+  //  - не выбирают цель внутри зоны (freeSpot вырезает её из интервалов);
+  //  - не останавливаются в ней: если собака уже внутри (зона появилась на
+  //    лету / окно OBS сузилось) — ей назначается ближайшая выходная точка;
+  //  - проходят сквозь зону только транзитом (по пути к цели), без остановок.
+  // no_dog_zone_show=true рисует пунктирный контур — удобно для настройки в
+  // обычном браузере; в OBS держите false (плашка и так полностью прозрачна).
+  // =========================================================================
+  let NoDogZonePx = null;         // зона в пикселях или null
+  function updateNoDogZone() {
+    const z = DisplayCfg.no_dog_zone_pct;
+    const el = document.getElementById("nodogzone");
+    if (!z || typeof z !== "object" || !Number.isFinite(+z.w) || +z.w <= 0 || +z.h <= 0) {
+      NoDogZonePx = null;
+      if (el) el.style.display = "none";
+      return;
+    }
+    const W = areaW(), H = Math.max(120, yard.clientHeight);
+    const zx = (Math.max(0, Math.min(100, +z.x || 0)) / 100) * W;
+    const zw = (Math.max(0, Math.min(100, +z.w)) / 100) * W;
+    // y=0 — самый низ «пола» (там, где стоят собаки), выше — больше.
+    // Так зону рисовать интуитивно: плашка над нижней кромкой = y:0..h:N.
+    const zh = (Math.max(0, Math.min(100, +z.h)) / 100) * H;
+    const zy = (Math.max(0, Math.min(100, +z.y || 0)) / 100) * H;   // низ зоны
+    NoDogZonePx = { x: zx, w: zw, h: zh, yTop: H - zy - zh };       // yTop — верх зоны от верха yard
+    if (el) {
+      // el живёт ВНУТРИ #yard — координаты совпадают с NoDogZonePx 1:1
+      el.style.display = DisplayCfg.no_dog_zone_show ? "block" : "none";
+      el.style.left = zx.toFixed(0) + "px";
+      el.style.width = zw.toFixed(0) + "px";
+      el.style.height = zh.toFixed(0) + "px";
+      el.style.bottom = zy.toFixed(0) + "px";
+      el.style.top = "auto";
+    }
+  }
+
+  // Вертикальный диапазон собаки [topY, botY] при позиции центра d.x.
+  function dogVerticalSpan(d) {
+    const H = Math.max(120, yard.clientHeight);
+    const bottom = parseFloat(getComputedStyle(d.el).bottom) || 0;   // учтён --ground
+    const dh = d.el.offsetHeight || dogW();
+    const top = H - bottom - dh;
+    return [top, top + dh];
+  }
+
+  // Пересекает ли собаку запретная зона по обеим осям.
+  function dogInZone(d) {
+    const z = NoDogZonePx;
+    if (!z) return false;
+    const dw = dogW();
+    const [t, b] = dogVerticalSpan(d);
+    return (d.x + dw / 2 > z.x) && (d.x - dw / 2 < z.x + z.w) &&
+           (b > z.yTop) && (t < z.yTop + z.h);
+  }
+
+  // Ближайшая точка вне зоны по горизонтали (для «выдворения» застрявших).
+  function zoneEscapeX(d) {
+    const z = NoDogZonePx, w = areaW(), dw = dogW();
+    const m = Math.max(4, nameOverhang(d));
+    const leftFree = z.x - dw / 2 - 6;            // сразу слева от зоны
+    const rightFree = z.x + z.w + dw / 2 + 6;     // сразу справа
+    const lo = m + dw / 2, hi = w - m - dw / 2;
+    const cand = [];
+    if (leftFree >= lo) cand.push(leftFree);
+    if (rightFree <= hi) cand.push(rightFree);
+    if (!cand.length) return lo;                  // зона перекрывает всю ширину
+    let best = cand[0], bd = Math.abs(cand[0] - d.x);
+    for (const c of cand.slice(1)) { const dd = Math.abs(c - d.x); if (dd < bd) { best = c; bd = dd; } }
+    return best;
+  }
+
+  let lastCfgJson = "";
+  function fetchDisplayCfg() {
+    fetch("/api/config", { cache: "no-store" })
+      .then((r) => r.ok ? r.json() : null)
+      .then((c) => {
+        if (!c) return;
+        const j = JSON.stringify(c);
+        if (j !== lastCfgJson) { lastCfgJson = j; applyDisplayCfg(c); }
+      })
+      .catch(() => {});   // конфиг опционален — живём на значениях по умолчанию
+  }
+
+  // =========================================================================
   // Выбор файла спрайта: порода + поза + направление, с фолбэками
   // =========================================================================
   // Порядок поиска (первое совпадение выигрывает):
@@ -404,12 +558,106 @@
       .getPropertyValue("--dog-size"));
     return (isNaN(sz) ? 110 : sz) * (Assets.ratio || 1);
   }
+  // Ширина ника с учётом transform:translate(-50%): ник выступает за карточку
+  // собаки примерно на половину своей ширины в каждую сторону.
+  function nameOverhang(d) {
+    const nm = d.el.querySelector(".name");
+    if (!nm) return 0;
+    return Math.max(0, (nm.offsetWidth - dogW()) / 2 + 4);
+  }
+  // Держим собаку ПОЛНОСТЬЮ внутри экрана вместе с ником — иначе длинный ник
+  // залезает за край, а OBS Browser Source трактовал такое переполнение как
+  // появление полос прокрутки (страница «съезжала»).
+  function clampDog(d) {
+    const w = areaW(), dw = dogW();
+    const m = Math.max(4, nameOverhang(d));
+    const max = Math.max(4, w - dw - m);
+    d.x = Math.min(Math.max(d.x, m), max);
+    d.target = Math.min(Math.max(d.target, m), max);
+  }
+  // Пересчёт позиции без CSS-анимации left: иначе «телепорт» в clampDog
+  // превращался в плавное скольжение на 0.25 c и собаки «плыли» назад.
+  function reposition(d) {
+    const el = d.el;
+    el.style.transitionDuration = "0s";
+    applyPose(d);
+    void el.offsetWidth;                                // форсируем layout, чтобы transitionDuration подействовал до следующего left
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      el.style.transitionDuration = ((Assets.frameMs || 250) / 1000).toFixed(2) + "s";
+    }));
+  }
   function rand(a, b) { return a + Math.random() * (b - a); }
 
+  // =========================================================================
+  // Толпа: собаки не должны проходить ДРУГ ЧЕРЕЗ ДРУГА и залезать на будку.
+  // 1) min_dog_gap — дистанция расталкивания (config/display.json);
+  // 2) crowd_auto_scale — при большом числе собак масштаб плавно уменьшается;
+  // 3) reserved[] — занятые интервалы: будка (постоянно) и уходящие в неё
+  //    собаки (временно). Новые цели выбираются только в свободных интервалах.
+  // =========================================================================
+  const reserved = [];
+  let crowdCur = 1;        // текущий применённый множитель масштаба собак
+
+  function updateCrowdScale() {
+    const c = DisplayCfg;
+    const n = dogs.size;
+    let target = Math.max(0.2, Math.min(5, c.dog_scale || 1));
+    if (c.crowd_auto_scale && n > (c.crowd_dogs_for_min || 18)) {
+      const over = n - (c.crowd_dogs_for_min || 18);
+      target *= Math.max(Math.min(1, c.crowd_scale_min || 0.6), 1 - over * 0.03);
+    }
+    // плавный разгон к целевому масштабу — без рывков при смене числа собак
+    crowdCur = Math.abs(crowdCur - target) < 0.01 ? target : crowdCur + (target - crowdCur) * 0.15;
+    document.documentElement.style.setProperty("--dog-size",
+      (cssNumPx("--dog-base", 90) * crowdCur).toFixed(1) + "px");
+  }
+
+  // Пересчёт занятых интервалов перед выбором целей.
+  function buildReserved(dw) {
+    reserved.length = 0;
+    const kh = cssNumPx("--kennel-h", 150);
+    const kw = kh * (Assets.kennelRatio || 1.5);
+    const kLeft = areaW() - kw;
+    reserved.push([Math.max(0, kLeft - dw * 0.6), areaW()]);   // будка
+    for (const [, o] of dogs) {                                 // уходящие в будку
+      if (o.leaving) reserved.push([o.x - dw / 2, o.x + dw * 1.2]);
+    }
+  }
+
+  // Случайная точка из незанятых интервалов [lo, hi].
+  // Запретная зона (no_dog_zone_pct) вырезается из интервалов, если собака
+  // вертикально с ней пересекается — цели внутри зоны не бывает.
+  function freeSpot(lo, hi, d) {
+    if (hi <= lo) return lo;
+    const ivs = [[lo, hi]];
+    const allReserved = reserved.slice();
+    if (NoDogZonePx && d && dogInZone(d)) {
+      allReserved.push([NoDogZonePx.x - dogW() / 2 - 6, NoDogZonePx.x + NoDogZonePx.w + dogW() / 2 + 6]);
+    }
+    for (const [a, b] of allReserved) {
+      const out = [];
+      for (const [x, y] of ivs) {
+        if (b <= x || a >= y) { out.push([x, y]); continue; }
+        if (a > x) out.push([x, Math.min(a, y)]);
+        if (b < y) out.push([Math.max(b, x), y]);
+      }
+      ivs.length = 0;
+      for (const iv of out) if (iv[1] > iv[0]) ivs.push(iv);
+      if (!ivs.length) break;
+    }
+    if (!ivs.length) return lo;
+    const lens = ivs.map(([x, y]) => y - x);
+    let r = Math.random() * lens.reduce((s, v) => s + v, 0);
+    for (let i = 0; i < ivs.length; i++) {
+      if (r <= lens[i]) return ivs[i][0] + r;
+      r -= lens[i];
+    }
+    return ivs[ivs.length - 1][1];
+  }
+
   function spawnX() {
-    // выходим из будки: ширина будки = её высота * пропорции PNG (замер JS)
-    const kh = parseFloat(getComputedStyle(document.documentElement)
-      .getPropertyValue("--kennel-h")) || 150;
+    // выходим из-за будки: ширина будки = её высота * пропорции PNG (замер JS)
+    const kh = cssNumPx("--kennel-h", 150);
     const kw = Math.round(kh * (Assets.kennelRatio || 1.5));
     return areaW() - kw - rand(0, 40);
   }
@@ -428,13 +676,19 @@
       d.target = d.x;
       d.pausedUntil = Date.now() + rand(PAUSE_MIN_MS, PAUSE_MAX_MS);
     } else {
-      d.target = rand(4, Math.max(6, w - dw - 4));
+      // границы цели учитывают свес ника (clampDog), иначе длинный ник на
+      // правом краю залезет за экран — OBS рисовал полосы прокрутки
+      const m = Math.max(4, nameOverhang(d));
+      buildReserved(dw);
+      // не заводим гуляющую собаку в будку и в хвост уходящей в будку;
+      // внутри запретной зоны цель тоже не выбирается (см. freeSpot)
+      d.target = freeSpot(m, Math.max(m + 2, w - dw - m), d);
+      if (NoDogZonePx && dogInZone(d)) d.target = zoneEscapeX(d); // страховка
       d.pausedUntil = 0;
     }
     d.running = Math.random() < 0.18;                   // иногда zoomies
     d.speed = d.running ? rand(140, 260) : rand(35, 80); // px/сек
   }
-
   function applyPose(d) {
     const el = d.el;
     el.style.left = d.x.toFixed(0) + "px";              // bottom не трогаем — пол фиксирован
@@ -446,8 +700,16 @@
 
   function tickWalk() {
     const dt = WALK_TICK / 1000;
+    // сначала сдвиг всех, затем расталкивание — собаки не проходят друг
+    // через друга (min_dog_gap из config/display.json, 0 = выключить)
     for (const [, d] of dogs) {
       if (d.leaving) continue;
+      // запретная зона: если собака остановилась/зависла внутри плашки —
+      // выгоняем к ближайшей точке вне зоны (транзитом пройти можно)
+      if (NoDogZonePx && dogInZone(d) && Math.abs(d.target - d.x) < 2) {
+        d.target = zoneEscapeX(d);
+        d.pausedUntil = 0;
+      }
       const dx = d.target - d.x;
       const step = d.speed * dt;
       if (Math.abs(dx) <= step) {
@@ -461,10 +723,63 @@
       } else {
         d.x += Math.sign(dx) * step;
       }
-      applyPose(d);
+      clampDog(d);                                    // ник не должен вылезать за край экрана
+    }
+    separateDogs();
+    for (const [, d] of dogs) if (!d.leaving) applyPose(d);
+  }
+
+  // Расталкивание парных пересечений (несколько проходов для плотной толпы).
+  function separateDogs() {
+    const gapPx = DisplayCfg.min_dog_gap;
+    if (!(gapPx > 0)) return;
+    const dw = dogW(), minSep = dw + gapPx;
+    const arr = [...dogs.values()].filter((d) => !d.leaving)
+              .sort((a, b) => a.x - b.x);
+    for (let pass = 0; pass < 3; pass++) {
+      let moved = false;
+      for (let i = 0; i + 1 < arr.length; i++) {
+        const a = arr[i], b = arr[i + 1];
+        const need = minSep - (b.x - a.x);
+        if (need > 0.5) {
+          const half = need / 2;
+          a.x -= half; b.x += half;
+          moved = true;
+        }
+      }
+      for (const d of arr) clampDog(d);               // после расталкивания — снова в кадре
+      if (!moved) break;
+    }
+    // запретная зона: расталкивание могло столкнуть собак под плашку или
+    // оставить толпу внутри неё — выгоняем каждую к ближайшему краю зоны
+    if (NoDogZonePx) {
+      for (const d of arr) {
+        if (dogInZone(d)) {
+          const before = d.x;
+          d.x = zoneEscapeX(d);
+          clampDog(d);
+          // цель тоже уводим из зоны, иначе собака «сядет» ровно на плашку
+          if (d.target !== undefined && Math.abs(d.target - d.x) < dogW()) d.target = d.x;
+          else d.target = zoneEscapeX(d);
+          if (Math.abs(before - d.x) > 0.5) reposition(d);
+        }
+      }
     }
   }
   setInterval(tickWalk, WALK_TICK);
+  // плавный «разгон» масштаба толпы + пересборка границ при смене числа собак
+  setInterval(updateCrowdScale, 400);
+
+  // При сужении окна (изменение размера Browser Source в OBS) собаки могли
+  // остаться за правым краем — пересчитываем границы для всех сразу.
+  window.addEventListener("resize", () => {
+    for (const [, d] of dogs) if (!d.leaving) {
+      const before = d.x;
+      clampDog(d);
+      if (Math.abs(before - d.x) > 0.5) reposition(d); // телепорт без «плытия»
+      else applyPose(d);
+    }
+  });
 
   // =========================================================================
   // Покадровая анимация: глобальный счётчик кадров, все собаки синхронно.
@@ -554,8 +869,9 @@
       x: spawnX(), target: 0, speed: 60, running: false,
       leaving: false, faceLeft: true, data, st: {}, pausedUntil: 0,
     };
-    el.querySelector(".name").textContent = data.name || login;
+    el.querySelector(".name").textContent = DisplayCfg.displayName(data.name || login);
     pickTarget(d);
+    clampDog(d);                                      // ник не вылезает за край с первой позиции
     applyPose(d);
     refreshDogSprite(d);
     yard.appendChild(el);
@@ -573,7 +889,9 @@
     if (!d || d.leaving) return;
     dogs.delete(login);
     d.leaving = true;
-    // уходит в будку: идёт за правый край, затем fadeout
+    // уходит в будку: идёт за правый край, затем fadeout.
+    // #yard теперь с overflow:hidden — собака аккуратно обрезается на границе
+    // зоны (раньше уходила «за экран» и создавала переполнение страницы).
     d.target = areaW() + dogW();
     d.running = true; d.speed = 160;
     applyPose(d);
@@ -595,7 +913,7 @@
       mods.set(login, el);
       roost.appendChild(el);
     }
-    el.querySelector(".name").textContent = data.name || login;
+    el.querySelector(".name").textContent = DisplayCfg.displayName(data.name || login);
     const tint = tintFor(data.color);
     el._st = el._st || {};
     el._st.tint = tint || "";
@@ -624,7 +942,11 @@
       if (d) {
         d.data = dd;
         const nm = d.el.querySelector(".name");
-        if (nm.textContent !== dd.name) nm.textContent = dd.name;
+        const wantName = DisplayCfg.displayName(dd.name || dd.login);
+        if (nm.textContent !== wantName) {
+          nm.textContent = wantName;
+          clampDog(d);                                // ник сменился/вырос — не выпускаем за край
+        }
         const tint = tintFor(dd.color);
         d.el.classList.toggle("tinted", !!tint);
         (d.st = d.st || {}).tint = tint || "";
@@ -738,6 +1060,11 @@
     document.getElementById("t-assets").onclick = () =>
       Assets.load().then(startFrameTimer);
   }
+
+  // конфиг отображения: первый запрос сразу + опрос раз в 5 c (правка
+  // config/display.json подхватывается без перезапуска сервиса)
+  fetchDisplayCfg();
+  setInterval(fetchDisplayCfg, 5000);
 
   Assets.load().then(startFrameTimer);
 })();
