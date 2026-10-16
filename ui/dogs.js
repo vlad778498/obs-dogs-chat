@@ -302,6 +302,10 @@
     ground_offset_px: 0, show_mods_on_roof: true,
     no_dog_zone_pct: null,   // зона, где собакам нельзя останавливаться и толпиться;
                              // {x,y,w,h} в % от размеров сцены или null = выкл.
+    no_dog_zone_mode: "avoid", // "avoid" — не садятся, но транзитом проходить могут;
+                               // "block" — вообще не входят в зону (обходят её)
+    no_dog_zone_force: true,   // block: если собака уже внутри зоны (зона появилась
+                               // на лету / окно OBS сузилось) — мягко вывести её влево
     no_dog_zone_show: false, // показывать ли контур зоны (для настройки в браузере;
                              // для OBS оставьте false — плашка полностью прозрачна)
     crowdFactor: 1,          // текущий авто-коэффициент толпы (см. applyDisplayCfg)
@@ -383,8 +387,15 @@
   // {x, y, w, h} в ПРОЦЕНТАХ от размеров сцены (y — сверху вниз). Собаки:
   //  - не выбирают цель внутри зоны (freeSpot вырезает её из интервалов);
   //  - не останавливаются в ней: если собака уже внутри (зона появилась на
-  //    лету / окно OBS сузилось) — ей назначается ближайшая выходная точка;
-  //  - проходят сквозь зону только транзитом (по пути к цели), без остановок.
+  //    лету / окно OBS сузилось) — ей назначается ближайшая выходная точка.
+  // Режим no_dog_zone_mode:
+  //  "avoid" (по умолчанию) — то, что выше: сквозь зону можно ПРОХОДИТЬ
+  //          транзитом по пути к цели, но нельзя сидеть/толпиться;
+  //  "block" — собакам нельзя даже проходить: зона вырезается из целей,
+  //          а если путь лежит через неё (например, спавн справа от широкой
+  //          зоны на пол-экрана) — цель принудительно ставится СЛЕВА от
+  //          зоны, и собака уходит туда ходить. no_dog_zone_force=true при
+  //          этом мягко выводит застрявших внутри (телепорт к левому краю).
   // no_dog_zone_show=true рисует пунктирный контур — удобно для настройки в
   // обычном браузере; в OBS держите false (плашка и так полностью прозрачна).
   // =========================================================================
@@ -444,11 +455,18 @@
     const lo = m + dw / 2, hi = w - m - dw / 2;
     const cand = [];
     if (leftFree >= lo) cand.push(leftFree);
-    if (rightFree <= hi) cand.push(rightFree);
+    if (rightFree <= hi && !zoneBlocks()) cand.push(rightFree); // в block-режиме
     if (!cand.length) return lo;                  // зона перекрывает всю ширину
     let best = cand[0], bd = Math.abs(cand[0] - d.x);
     for (const c of cand.slice(1)) { const dd = Math.abs(c - d.x); if (dd < bd) { best = c; bd = dd; } }
     return best;
+  }
+
+  // Режим "block": зона непроходима — нельзя ни сидеть в ней, ни проходить
+  // транзитом. "avoid" (по умолчанию): транзит разрешён, запрещены только
+  // остановки/цели внутри зоны.
+  function zoneBlocks() {
+    return !!NoDogZonePx && String(DisplayCfg.no_dog_zone_mode || "avoid") === "block";
   }
 
   let lastCfgJson = "";
@@ -663,7 +681,9 @@
     if (hi <= lo) return lo;
     const ivs = [[lo, hi]];
     const allReserved = reserved.slice();
-    if (NoDogZonePx && d && dogInZone(d)) {
+    if (NoDogZonePx && d && (dogInZone(d) || zoneBlocks())) {
+      // avoid: зону вырезаем, только если собака вертикально с ней пересекается;
+      // block: зона непроходима для всех — цели справа от неё недосягаемы
       allReserved.push([NoDogZonePx.x - dogW() / 2 - 6, NoDogZonePx.x + NoDogZonePx.w + dogW() / 2 + 6]);
     }
     for (const [a, b] of allReserved) {
@@ -716,6 +736,21 @@
       // внутри запретной зоны цель тоже не выбирается (см. freeSpot)
       d.target = freeSpot(m, Math.max(m + 2, w - dw - m), d);
       if (NoDogZonePx && dogInZone(d)) d.target = zoneEscapeX(d); // страховка
+      // Режим "block": зона непроходима даже транзитом. Если собака стоит
+      // справа от зоны (спавн у будки при зоне на пол-экрана) — обычная
+      // цель слева была бы недостижима без прохода сквозь зону, поэтому
+      // ставим ей «якорь» сразу за левым краем зоны: она уходит влево и
+      // ходит уже там. no_dog_zone_force=false — якорь не ставится (только
+      // запрет целей/посадки внутри зоны).
+      if (zoneBlocks() && d.x >= NoDogZonePx.x - dw / 2 - 2) {
+        const leftFree = NoDogZonePx.x - dw / 2 - 6;
+        if (leftFree >= m + dw / 2) {
+          d.target = DisplayCfg.no_dog_zone_force ? leftFree : d.target;
+        } else {
+          // зона перекрывает всю ширину — держим у левого края экрана
+          d.target = m + dw / 2;
+        }
+      }
       d.pausedUntil = 0;
     }
     d.running = Math.random() < 0.18;                   // иногда zoomies
@@ -784,7 +819,7 @@
     }
     // запретная зона: расталкивание могло столкнуть собак под плашку или
     // оставить толпу внутри неё — выгоняем каждую к ближайшему краю зоны
-    if (NoDogZonePx) {
+    if (NoDogZonePx && (!zoneBlocks() || DisplayCfg.no_dog_zone_force !== false)) {
       for (const d of arr) {
         if (dogInZone(d)) {
           const before = d.x;

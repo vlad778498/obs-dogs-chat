@@ -62,12 +62,14 @@ def dog_in_zone(x, z, dog_bottom=0.0, dog_h=DW):
         and (b > z["yTop"]) and (t < z["yTop"] + z["h"])
 
 
-def zone_escape_x(x, z, m=4.0):
-    """Порт zoneEscapeX(d)."""
+def zone_escape_x(x, z, m=4.0, blocks=False):
+    """Порт zoneEscapeX(d). В block-режиме правый край зоны недоступен —
+    собака всегда выдворяется влево (зону нельзя переходить)."""
     left_free = z["x"] - DW / 2 - 6
     right_free = z["x"] + z["w"] + DW / 2 + 6
     lo, hi = m + DW / 2, W - m - DW / 2
-    cand = [c for c in (left_free, right_free) if lo <= c <= hi]
+    cands = [left_free] if blocks else [left_free, right_free]
+    cand = [c for c in cands if lo <= c <= hi]
     if not cand:
         return lo
     return min(cand, key=lambda c: abs(c - x))
@@ -85,13 +87,14 @@ def subtract_ivs(ivs, a, b):
     return [(x, y) for x, y in out if y > x]
 
 
-def free_spot(lo, hi, reserved, z, dpos):
-    """Порт freeSpot(): зона вырезается только если собака уже в ней по вертикали."""
+def free_spot(lo, hi, reserved, z, dpos, blocks=False):
+    """Порт freeSpot(): в avoid-зоне вырезается только если собака уже в ней
+    по вертикали; в block-зоне — всегда (зона непроходима)."""
     if hi <= lo:
         return lo
     ivs = [(lo, hi)]
     allr = list(reserved)
-    if z and dog_in_zone(dpos, z):
+    if z and (blocks or dog_in_zone(dpos, z)):
         allr.append((z["x"] - DW / 2 - 6, z["x"] + z["w"] + DW / 2 + 6))
     for a, b in allr:
         ivs = subtract_ivs(ivs, a, b)
@@ -107,6 +110,17 @@ def free_spot(lo, hi, reserved, z, dpos):
             return x + r
         r -= ln
     return ivs[-1][1]
+
+
+def pick_target_block(x, z, m=4.0):
+    """Порт block-ветки pickTarget(): собака справа от непроходимой зоны
+    получает якорь сразу за её левым краем (уходит влево и ходит там)."""
+    left_free = z["x"] - DW / 2 - 6
+    if x >= z["x"] - DW / 2 - 2:
+        if left_free >= m + DW / 2:
+            return left_free
+        return m + DW / 2          # зона перекрывает всю ширину
+    return None                     # слева — обычная цель (не наш случай)
 
 
 def main():
@@ -127,6 +141,8 @@ def main():
     # 2) конфиг-пример
     check("example: no_dog_zone_pct в JSON", "no_dog_zone_pct" in ex)
     check("example: no_dog_zone_show в JSON", "no_dog_zone_show" in ex)
+    check("example: no_dog_zone_mode в JSON", ex.get("no_dog_zone_mode") == "avoid")
+    check("example: no_dog_zone_force в JSON", ex.get("no_dog_zone_force") is True)
 
     # 3) сервер: /api/config содержит ключи (реальный HTTP-запрос)
     sys.path.insert(0, str(BASE))
@@ -134,6 +150,8 @@ def main():
     cfg = dogs_chat.load_display_config()
     check("DEFAULT: no_dog_zone_pct", "no_dog_zone_pct" in cfg)
     check("DEFAULT: no_dog_zone_show", "no_dog_zone_show" in cfg)
+    check("DEFAULT: no_dog_zone_mode", cfg.get("no_dog_zone_mode") == "avoid")
+    check("DEFAULT: no_dog_zone_force", cfg.get("no_dog_zone_force") is True)
 
     from http.server import ThreadingHTTPServer
     srv = ThreadingHTTPServer(("127.0.0.1", 0), dogs_chat.Handler)
@@ -143,14 +161,20 @@ def main():
         got = json.loads(resp.read().decode("utf-8"))
     srv.shutdown()
     check("/api/config отдаёт no_dog_zone_pct", "no_dog_zone_pct" in got)
+    check("/api/config отдаёт no_dog_zone_mode", "no_dog_zone_mode" in got)
+    check("/api/config отдаёт no_dog_zone_force", "no_dog_zone_force" in got)
 
     # 4) разметка/стили
     check('index.html: div id="nodogzone"', 'id="nodogzone"' in html)
     check("dogs.css: селектор #nodogzone", "#nodogzone" in css)
-    for fn in ("updateNoDogZone", "dogInZone", "zoneEscapeX", "dogVerticalSpan"):
+    for fn in ("updateNoDogZone", "dogInZone", "zoneEscapeX", "dogVerticalSpan",
+               "zoneBlocks"):
         check(f"dogs.js: функция {fn}", re.search(r"function %s\b" % fn, js) is not None)
     check("dogs.js: freeSpot вызывается с собакой", "freeSpot(m, Math.max(m + 2, w - dw - m), d)" in js)
     check("dogs.js: tickWalk выгоняет из зоны", "zoneEscapeX(d);" in js)
+    check("dogs.js: block-ветка в pickTarget", "zoneBlocks() && d.x >= NoDogZonePx.x - dw / 2 - 2" in js)
+    check("dogs.js: freeSpot режет зону всегда в block", "(dogInZone(d) || zoneBlocks())" in js)
+    check("dogs.js: zoneEscapeX не пускает вправо в block", "!zoneBlocks()" in js)
 
     # 5) логическая модель
     z = make_zone({"x": 35, "y": 0, "w": 30, "h": 25})   # плашка по центру внизу
@@ -176,6 +200,37 @@ def main():
     check("зона null: dog_in_zone=False", not dog_in_zone(500, None))
     spot3 = free_spot(49, W - DW - 49, [], None, 500)
     check("зона null: freeSpot как раньше", 49 <= spot3 <= W - DW - 49)
+
+    # --- режим block: зона на ПРАВУЮ половину экрана (x=50..100), спавн справа ---
+    zb = make_zone({"x": 50, "y": 0, "w": 50, "h": 60})
+    spawn = 850.0                                  # типичный спавн у будки
+    check("block: спавн справа от зоны — в зоне/за ней", spawn >= zb["x"] - DW / 2)
+    anchor = pick_target_block(spawn, zb)
+    check("block: якорь цели слева от зоны", anchor is not None and anchor < zb["x"])
+    check("block: якорь = левый край зоны минус полсобаки", abs(anchor - (500 - DW / 2 - 6)) < 1e-6)
+    check("block: собака не проходит зону транзитом (escape всегда влево)",
+          zone_escape_x(700, zb, blocks=True) < zb["x"] and
+          zone_escape_x(600, zb, blocks=True) < zb["x"])
+    spotb = free_spot(49, W - DW - 49, [], zb, 100, blocks=True)   # собака ДАЛЕКО слева
+    check("block: цель не справа от зоны даже для дальней собаки", spotb <= zb["x"] + 1e-6)
+    check("block: escape вне зоны", not dog_in_zone(zone_escape_x(600, zb, blocks=True), zb))
+    # avoid (по умолчанию) при зоне на правую половину: правый край зоны
+    # выходит за экран, поэтому escape ведёт к левому краю — но НЕ вправо.
+    check("avoid: escape не выкидывает за правый край экрана",
+          zone_escape_x(600, zb, blocks=False) <= W and
+          not dog_in_zone(zone_escape_x(600, zb, blocks=False), zb))
+    # avoid при зоне ПО ЦЕНТРУ (35..65%): оба края доступны, escape выбирает
+    # ближайший — справа от центра ближе правый край (транзит разрешён).
+    zc = make_zone({"x": 35, "y": 0, "w": 30, "h": 25})
+    esc_avoid = zone_escape_x(520, zc, blocks=False)
+    esc_block = zone_escape_x(520, zc, blocks=True)
+    check("avoid: ближайший край может быть справа", esc_avoid > zc["x"] + zc["w"])
+    check("block: всегда влево, даже когда правый край ближе", esc_block < zc["x"])
+    # force=false => якорь не ставим (в JS это d.target остаётся из freeSpot);
+    # модель: без якоря обычная цель тоже не внутри зоны (freeSpot её режет)
+    spot_noforce = free_spot(49, W - DW - 49, [], zb, spawn, blocks=True)
+    check("block force=false: цель всё равно не внутри зоны",
+          not (zb["x"] < spot_noforce < zb["x"] + zb["w"]))
 
     print("\n%d ошибок" % len(FAILS))
     if FAILS:

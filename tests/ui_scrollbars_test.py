@@ -53,13 +53,13 @@ for fn in ("function nameOverhang", "function clampDog", "function reposition"):
     check(f"js: {fn}() определена", fn in JS)
 
 check("js: tickWalk вызывает clampDog",
-      bool(re.search(r"function tickWalk[\s\S]{0,900}?clampDog\(d\)", JS)))
+      bool(re.search(r"function tickWalk[\s\S]{0,1400}?clampDog\(d\)", JS)))
 check("js: pickTarget учитывает свес ника (m=nameOverhang)",
       bool(re.search(r"function pickTarget[\s\S]{0,700}?nameOverhang\(d\)", JS)))
 check("js: addWalker вызывает clampDog",
       bool(re.search(r"function addWalker[\s\S]{0,900}?clampDog\(d\)", JS)))
 check("js: смена ника обновляет границы (update->clampDog)",
-      bool(re.search(r"nm\.textContent !== dd\.name[\s\S]{0,200}?clampDog\(d\)", JS)))
+      bool(re.search(r"nm\.textContent !== wantName[\s\S]{0,200}?clampDog\(d\)", JS)))
 check("js: обработчик window resize", 'addEventListener("resize"' in JS)
 
 # --- Численная симуляция геометрии -----------------------------------------
