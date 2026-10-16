@@ -12,6 +12,7 @@
 # Примеры типовых кандидатов: чат-боты (StreamElements, Nightbot, Moobot,
 # Fossibot, Wizey), счётчики, спам-фильтры.
 
-# StreamElements
-# Nightbot
-# Moobot
+StreamElements
+Nightbot
+Moobot
+JeetBot

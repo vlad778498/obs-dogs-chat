@@ -43,11 +43,11 @@
     liveDot = document.createElement("div");
     liveDot.id = "live-dot";
     liveDot.title = "Индикатор получения данных с сервера";
-    Object.assign(liveDot.style, {
+    /*Object.assign(liveDot.style, {
       position: "fixed", top: "8px", left: "8px", width: "14px", height: "14px",
       borderRadius: "50%", background: "#e33", zIndex: "9999",
       boxShadow: "0 0 6px rgba(0,0,0,.5)", transition: "background .3s",
-    });
+    });*/
     document.body.appendChild(liveDot);
     function setLive(ok) {
       if (!liveDot || document.body.classList.contains("obs")) return;
