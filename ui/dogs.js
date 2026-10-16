@@ -469,6 +469,26 @@
     return !!NoDogZonePx && String(DisplayCfg.no_dog_zone_mode || "avoid") === "block";
   }
 
+  // Пересекает ли собака зону по ВЕРТИКАЛИ (в отличие от dogInZone — без
+  // требования по горизонтали). Собаки живут у «пола», поэтому при y=0..h:N
+  // это почти всегда true; если зону подняли высоко — собаки под ней ходят
+  // свободно даже в режиме block.
+  function dogVerticalOverlap(z) {
+    if (!z) return false;
+    const H = Math.max(120, yard.clientHeight);
+    const bottom = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ground")) || 0;
+    const dh = (cssNumPx("--dog-size", 90) * 1.35) + 34;   // собака + ник сверху
+    const botY = H - bottom;                                // низ собаки от верха yard
+    return botY > z.yTop && (botY - dh) < z.yTop + z.h;
+  }
+
+  // Влияет ли зона на данную собаку: в block — если пересекается по вертикали
+  // (сквозь зону ходить нельзя); в avoid — только если реально попадает в неё.
+  function zoneAffects(d) {
+    if (!NoDogZonePx) return false;
+    return zoneBlocks() ? dogVerticalOverlap(NoDogZonePx) : dogInZone(d);
+  }
+
   let lastCfgJson = "";
   let cfgTries = 0;        // сколько раз не удалось загрузить конфиг (для диагностики)
   function fetchDisplayCfg() {
@@ -681,9 +701,10 @@
     if (hi <= lo) return lo;
     const ivs = [[lo, hi]];
     const allReserved = reserved.slice();
-    if (NoDogZonePx && d && (dogInZone(d) || zoneBlocks())) {
-      // avoid: зону вырезаем, только если собака вертикально с ней пересекается;
-      // block: зона непроходима для всех — цели справа от неё недосягаемы
+    if (d && zoneAffects(d)) {
+      // avoid: зону вырезаем, только если собака реально попадает в неё;
+      // block: зона непроходима для всех собак, пересекающих её по вертикали,
+      //      — цели справа от зоны для них недосягаемы (см. якорь в pickTarget)
       allReserved.push([NoDogZonePx.x - dogW() / 2 - 6, NoDogZonePx.x + NoDogZonePx.w + dogW() / 2 + 6]);
     }
     for (const [a, b] of allReserved) {
@@ -737,15 +758,21 @@
       d.target = freeSpot(m, Math.max(m + 2, w - dw - m), d);
       if (NoDogZonePx && dogInZone(d)) d.target = zoneEscapeX(d); // страховка
       // Режим "block": зона непроходима даже транзитом. Если собака стоит
-      // справа от зоны (спавн у будки при зоне на пол-экрана) — обычная
-      // цель слева была бы недостижима без прохода сквозь зону, поэтому
-      // ставим ей «якорь» сразу за левым краем зоны: она уходит влево и
-      // ходит уже там. no_dog_zone_force=false — якорь не ставится (только
-      // запрет целей/посадки внутри зоны).
-      if (zoneBlocks() && d.x >= NoDogZonePx.x - dw / 2 - 2) {
+      // справа от зоны или ВНУТРИ неё (спавн у будки при зоне на пол-экрана;
+      // зону включили/расширили на лету) — обычная цель слева была бы
+      // недостижима без прохода сквозь зону, поэтому ставим ей «якорь» сразу
+      // за левым краем зоны: она уходит влево и ходит уже там.
+      // no_dog_zone_force=false — якорь ставится только для собак ПРАВЕЕ зоны
+      // (спавн), а застрявших внутри не телепортируем (ждут новую цель).
+      if (zoneBlocks() && dogVerticalOverlap(NoDogZonePx)) {
         const leftFree = NoDogZonePx.x - dw / 2 - 6;
+        const rightEdge = NoDogZonePx.x + NoDogZonePx.w + dw / 2 + 6;
         if (leftFree >= m + dw / 2) {
-          d.target = DisplayCfg.no_dog_zone_force ? leftFree : d.target;
+          const atOrRightOfZone = d.x >= NoDogZonePx.x - dw / 2 - 2;
+          const insideZone = d.x > NoDogZonePx.x - dw / 2 && d.x < rightEdge - dw / 2;
+          if (atOrRightOfZone || (insideZone && DisplayCfg.no_dog_zone_force)) {
+            d.target = leftFree;
+          }
         } else {
           // зона перекрывает всю ширину — держим у левого края экрана
           d.target = m + dw / 2;
@@ -936,6 +963,13 @@
       x: spawnX(), target: 0, speed: 60, running: false,
       leaving: false, faceLeft: true, data, st: {}, pausedUntil: 0,
     };
+    // В режиме block спавн не должен оказываться внутри запретной зоны:
+    // сразу выводим собаку к левому краю зоны (она «выходит» и уходит влево).
+    if (zoneBlocks() && dogVerticalOverlap(NoDogZonePx) &&
+        d.x > NoDogZonePx.x - dogW() / 2 && DisplayCfg.no_dog_zone_force !== false) {
+      const lf = NoDogZonePx.x - dogW() / 2 - 6;
+      d.x = Math.max(areaW() * 0.05, lf);
+    }
     el.querySelector(".name").textContent = DisplayCfg.displayName(data.name || login);
     pickTarget(d);
     clampDog(d);                                      // ник не вылезает за край с первой позиции

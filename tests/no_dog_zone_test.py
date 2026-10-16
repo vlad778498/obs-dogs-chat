@@ -172,8 +172,12 @@ def main():
         check(f"dogs.js: функция {fn}", re.search(r"function %s\b" % fn, js) is not None)
     check("dogs.js: freeSpot вызывается с собакой", "freeSpot(m, Math.max(m + 2, w - dw - m), d)" in js)
     check("dogs.js: tickWalk выгоняет из зоны", "zoneEscapeX(d);" in js)
-    check("dogs.js: block-ветка в pickTarget", "zoneBlocks() && d.x >= NoDogZonePx.x - dw / 2 - 2" in js)
-    check("dogs.js: freeSpot режет зону всегда в block", "(dogInZone(d) || zoneBlocks())" in js)
+    check("dogs.js: block-ветка в pickTarget", "zoneBlocks() && dogVerticalOverlap(NoDogZonePx)" in js)
+    check("dogs.js: freeSpot режет зону через zoneAffects", "if (d && zoneAffects(d))" in js)
+    check("dogs.js: zoneAffects — block учитывает вертикальное пересечение",
+          "return zoneBlocks() ? dogVerticalOverlap(NoDogZonePx) : dogInZone(d);" in js)
+    check("dogs.js: спавн выводится из зоны в block+force",
+          "d.x > NoDogZonePx.x - dogW() / 2 && DisplayCfg.no_dog_zone_force !== false" in js)
     check("dogs.js: zoneEscapeX не пускает вправо в block", "!zoneBlocks()" in js)
 
     # 5) логическая модель
