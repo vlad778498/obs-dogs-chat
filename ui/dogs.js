@@ -743,7 +743,16 @@
 
   function pickTarget(d) {
     const w = areaW(), dw = dogW();
-    if (Math.random() < PAUSE_CHANCE) {
+    // Режим "block" — зона непроходима для всех собак, пересекающих её по
+    // вертикали. Пауза/сидение ВНУТРИ зоны запрещены даже при
+    // no_dog_zone_force=false: иначе собаки «толпятся» на спавне у будки
+    // внутри плашки. force=false лишь отключает принудительный выгул уже
+    // застрявших внутри (они дождутся новой цели), но сидеть в зоне они не
+    // будут. При force=true им сразу ставится якорь за левым краем зоны.
+    const blockAnchor = zoneBlocks() && dogVerticalOverlap(NoDogZonePx) &&
+      ((d.x >= NoDogZonePx.x - dw / 2 - 2) ||
+       (dogInZone(d) && DisplayCfg.no_dog_zone_force !== false));
+    if (!blockAnchor && Math.random() < PAUSE_CHANCE) {
       // пауза: цель = текущая позиция → moving=false → idle-цикл;
       // через случайное время собака снова выберет цель
       d.target = d.x;
@@ -757,22 +766,21 @@
       // внутри запретной зоны цель тоже не выбирается (см. freeSpot)
       d.target = freeSpot(m, Math.max(m + 2, w - dw - m), d);
       if (NoDogZonePx && dogInZone(d)) d.target = zoneEscapeX(d); // страховка
-      // Режим "block": зона непроходима даже транзитом. Если собака стоит
-      // справа от зоны или ВНУТРИ неё (спавн у будки при зоне на пол-экрана;
-      // зону включили/расширили на лету) — обычная цель слева была бы
-      // недостижима без прохода сквозь зону, поэтому ставим ей «якорь» сразу
-      // за левым краем зоны: она уходит влево и ходит уже там.
-      // no_dog_zone_force=false — якорь ставится только для собак ПРАВЕЕ зоны
-      // (спавн), а застрявших внутри не телепортируем (ждут новую цель).
-      if (zoneBlocks() && dogVerticalOverlap(NoDogZonePx)) {
+      // Режим "block": зона непроходима даже транзитом. Собака справа от
+      // зоны или ВНУТРИ неё (спавн у будки при зоне на пол-экрана; зону
+      // включили/расширили на лету) не может получить обычную цель слева —
+      // она была бы недостижима без прохода сквозь зону. Поэтому ставим
+      // «якорь» у левого края зоны, НО собаку при этом НЕ телепортируем:
+      // она идёт к якорю пешком с текущей позиции (шаг движения в tickWalk
+      // всегда ≤ |target-x|, а hard-clamp ниже не даёт перейти границу
+      // зоны справа налево раньше времени — переход разрешается, только
+      // когда собака дошла до якоря).
+      // no_dog_zone_force=false — якорь ставится только для собак ПРАВЕЕ
+      // зоны (спавн); застрявших внутри не выгоняем принудительно.
+      if (blockAnchor) {
         const leftFree = NoDogZonePx.x - dw / 2 - 6;
-        const rightEdge = NoDogZonePx.x + NoDogZonePx.w + dw / 2 + 6;
         if (leftFree >= m + dw / 2) {
-          const atOrRightOfZone = d.x >= NoDogZonePx.x - dw / 2 - 2;
-          const insideZone = d.x > NoDogZonePx.x - dw / 2 && d.x < rightEdge - dw / 2;
-          if (atOrRightOfZone || (insideZone && DisplayCfg.no_dog_zone_force)) {
-            d.target = leftFree;
-          }
+          d.target = leftFree;
         } else {
           // зона перекрывает всю ширину — держим у левого края экрана
           d.target = m + dw / 2;
@@ -799,7 +807,9 @@
     for (const [, d] of dogs) {
       if (d.leaving) continue;
       // запретная зона: если собака остановилась/зависла внутри плашки —
-      // выгоняем к ближайшей точке вне зоны (транзитом пройти можно)
+      // выгоняем к ближайшей точке вне зоны (в avoid транзитом пройти можно;
+      // в block у застрявших внутри при force=false тоже появляется шанс
+      // выйти, как только они «остановятся» на новой цели)
       if (NoDogZonePx && dogInZone(d) && Math.abs(d.target - d.x) < 2) {
         d.target = zoneEscapeX(d);
         d.pausedUntil = 0;
@@ -815,7 +825,17 @@
           pickTarget(d);                                // дошла — куда идём дальше
         }
       } else {
-        d.x += Math.sign(dx) * step;
+        const nx = d.x + Math.sign(dx) * step;
+        // Режим "block" (hard): граница зоны физически непроходима справа
+        // налево. Собака с якорной целью слева идёт ВДОЛЬ границы и входит
+        // за неё только когда реально дошла до якоря (иначе получался
+        // телепорт через всю зону за пару секунд).
+        if (zoneBlocks() && dogVerticalOverlap(NoDogZonePx) &&
+            d.x > NoDogZonePx.x && nx < NoDogZonePx.x) {
+          d.x = (Math.abs(d.target - d.x) <= step * 1.5) ? d.target : NoDogZonePx.x;
+        } else {
+          d.x = nx;
+        }
       }
       clampDog(d);                                    // ник не должен вылезать за край экрана
     }
@@ -845,12 +865,23 @@
       if (!moved) break;
     }
     // запретная зона: расталкивание могло столкнуть собак под плашку или
-    // оставить толпу внутри неё — выгоняем каждую к ближайшему краю зоны
+    // оставить толпу внутри неё — выгоняем каждую к ближайшему краю зоны.
+    // В режиме block это НЕ телепорт через границу (иначе собаки «прыгали»
+    // из-за будки за зону): собаку, которую столкнули внутрь, возвращаем к
+    // правому краю зоны (откуда её вытеснили); влево она уйдёт сама пешком
+    // (якорь в pickTarget + hard-clamp в tickWalk).
     if (NoDogZonePx && (!zoneBlocks() || DisplayCfg.no_dog_zone_force !== false)) {
       for (const d of arr) {
         if (dogInZone(d)) {
           const before = d.x;
-          d.x = zoneEscapeX(d);
+          let nx = zoneEscapeX(d);
+          if (zoneBlocks()) {
+            // не переносим через левую границу зоны — только к правому краю
+            const rightEdge = NoDogZonePx.x + NoDogZonePx.w + dogW() / 2 + 6;
+            nx = Math.min(nx, Math.min(rightEdge, areaW() - dogW() / 2));
+            nx = Math.max(nx, NoDogZonePx.x + NoDogZonePx.w + 2);
+          }
+          d.x = nx;
           clampDog(d);
           // цель тоже уводим из зоны, иначе собака «сядет» ровно на плашку
           if (d.target !== undefined && Math.abs(d.target - d.x) < dogW()) d.target = d.x;
@@ -963,10 +994,14 @@
       x: spawnX(), target: 0, speed: 60, running: false,
       leaving: false, faceLeft: true, data, st: {}, pausedUntil: 0,
     };
-    // В режиме block спавн не должен оказываться внутри запретной зоны:
-    // сразу выводим собаку к левому краю зоны (она «выходит» и уходит влево).
+    // Режим block + force: спавн у будки попадает в запретную зону — собаку
+    // НЕ телепортируем: она появляется как обычно (за будкой) и сама идёт
+    // влево к левому краю зоны (якорь ставит pickTarget; hard-clamp в
+    // tickWalk не даёт пересечь границу раньше, чем дошла до якоря).
+    // force=false: спавним сразу за левым краем зоны (старое поведение),
+    // чтобы собака вообще не оказывалась внутри плашки.
     if (zoneBlocks() && dogVerticalOverlap(NoDogZonePx) &&
-        d.x > NoDogZonePx.x - dogW() / 2 && DisplayCfg.no_dog_zone_force !== false) {
+        d.x > NoDogZonePx.x - dogW() / 2 && DisplayCfg.no_dog_zone_force === false) {
       const lf = NoDogZonePx.x - dogW() / 2 - 6;
       d.x = Math.max(areaW() * 0.05, lf);
     }

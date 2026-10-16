@@ -172,12 +172,18 @@ def main():
         check(f"dogs.js: функция {fn}", re.search(r"function %s\b" % fn, js) is not None)
     check("dogs.js: freeSpot вызывается с собакой", "freeSpot(m, Math.max(m + 2, w - dw - m), d)" in js)
     check("dogs.js: tickWalk выгоняет из зоны", "zoneEscapeX(d);" in js)
-    check("dogs.js: block-ветка в pickTarget", "zoneBlocks() && dogVerticalOverlap(NoDogZonePx)" in js)
+    check("dogs.js: block-ветка в pickTarget (через blockAnchor)",
+          re.search(r"const blockAnchor = zoneBlocks\(\) && dogVerticalOverlap\(NoDogZonePx\)", js) is not None)
     check("dogs.js: freeSpot режет зону через zoneAffects", "if (d && zoneAffects(d))" in js)
     check("dogs.js: zoneAffects — block учитывает вертикальное пересечение",
           "return zoneBlocks() ? dogVerticalOverlap(NoDogZonePx) : dogInZone(d);" in js)
-    check("dogs.js: спавн выводится из зоны в block+force",
-          "d.x > NoDogZonePx.x - dogW() / 2 && DisplayCfg.no_dog_zone_force !== false" in js)
+    check("dogs.js: спавн НЕ телепортируется при block+force (идёт пешком)",
+          "DisplayCfg.no_dog_zone_force === false" in js and
+          "no_dog_zone_force !== false) {\n      const lf" not in js.split("separateDogs")[0])
+    check("dogs.js: hard-clamp границы зоны в tickWalk (нет прохода сквозь зону)",
+          "d.x > NoDogZonePx.x && nx < NoDogZonePx.x" in js)
+    check("dogs.js: separateDogs в block не переносит через левую границу",
+          "nx = Math.max(nx, NoDogZonePx.x + NoDogZonePx.w + 2);" in js)
     check("dogs.js: zoneEscapeX не пускает вправо в block", "!zoneBlocks()" in js)
 
     # 5) логическая модель
